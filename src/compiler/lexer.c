@@ -11,26 +11,27 @@ typedef struct {
     token_type type;
 } keyword;
 static const keyword keywords[] = {
-    { "if",      TOK_IF      },
-    { "as",      TOK_AS      },
-    { "sp",      TOK_SP      },
-    { "jmp",     TOK_JMP     },
-    { "use",     TOK_USE     },
-    { "int",     TOK_INT     },
-    { "all",     TOK_ALL     },
-    { "nop",     TOK_NOP     },
-    { "else",    TOK_ELSE    },
-    { "call",    TOK_CALL    },
-    { "hlt",    TOK_HLT     },
-    { "unuse",  TOK_UNUSE   },
-    { "limit",  TOK_LIMIT   },
-    { "flags",  TOK_FLAGS   },
-    { "return", TOK_RETURN  },
-    { "res",    TOK_RESERVE },
-    { "delete", TOK_DELETE  },
-    { "sizeof", TOK_SIZEOF  },
-    { "layout", TOK_LAYOUT  },
-    { "align",  TOK_ALIGN   }
+    { "if",        TOK_IF      },
+    { "as",        TOK_AS      },
+    { "sp",        TOK_SP      },
+    { "jmp",       TOK_JMP     },
+    { "use",       TOK_USE     },
+    { "int",       TOK_INT     },
+    { "all",       TOK_ALL     },
+    { "nop",       TOK_NOP     },
+    { "else",      TOK_ELSE    },
+    { "call",      TOK_CALL    },
+    { "hlt",      TOK_HLT      },
+    { "unuse",    TOK_UNUSE    },
+    { "limit",    TOK_LIMIT    },
+    { "flags",    TOK_FLAGS    },
+    { "return",   TOK_RETURN   },
+    { "res",      TOK_RESERVE  },
+    { "delete",   TOK_DELETE   },
+    { "sizeof",   TOK_SIZEOF   },
+    { "layout",   TOK_LAYOUT   },
+    { "aligned",  TOK_ALIGNED  },
+    { "bitset",   TOK_BITSET   }
 };
 static void lexer_error(char *msg, lexer_ctx *lexer) {
     char *line_start = lexer->currtok->location.line_start;
@@ -307,10 +308,6 @@ bool lex(source_file *file, vector *tokens) {
             lexer.currtok->type = TOK_OR;
             break;
         case '~':
-            if (*next == '=') {
-                lexer_accept_2chr(&lexer, TOK_TILDE_EQUAL);
-                break;
-            }
             lexer.currtok->type = TOK_TILDE;
             break;
         case '>':
@@ -320,9 +317,12 @@ bool lex(source_file *file, vector *tokens) {
                     break;
                 }
                 if (lexer.currch[2] == '>' && lexer.currch[3] == '=') {
-                    lexer.currtok->type = TOK_ROR_EQUAL;
-                    lexer.currtok->len = 4;
-                    lexer.currch += 3;
+                    if (lexer.currch[3] == '=') {
+                        lexer.currtok->type = TOK_ROR_EQUAL;
+                        lexer.currtok->len = 4;
+                        lexer.currch += 3;
+                    }
+                    lexer_accept_3chr(&lexer, TOK_ROR);
                     break;
                 }
                 lexer_accept_2chr(&lexer, TOK_SHR);
@@ -340,10 +340,13 @@ bool lex(source_file *file, vector *tokens) {
                     lexer_accept_3chr(&lexer, TOK_SHL_EQUAL);
                     break;
                 }
-                if (lexer.currch[2] == '<' && lexer.currch[3] == '=') {
-                    lexer.currtok->type = TOK_ROL_EQUAL;
-                    lexer.currtok->len = 4;
-                    lexer.currch += 3;
+                if (lexer.currch[2] == '<') {
+                    if (lexer.currch[3] == '=') {
+                        lexer.currtok->type = TOK_ROL_EQUAL;
+                        lexer.currtok->len = 4;
+                        lexer.currch += 3;
+                    }
+                    lexer_accept_3chr(&lexer, TOK_ROL);
                     break;
                 }
                 lexer_accept_2chr(&lexer, TOK_SHL);
@@ -498,9 +501,8 @@ token *advance_token(token_stream *stream) {
 // Consume the current tok if currtok.type == type. Returns the consumed tok.
 token *consume_token(token_type type, char *errmsg, token_stream *stream) {
     token *tok = current_token(stream);
-    if (tok->type == type) {
-        advance_token(stream);
-    } else if (stream->pos > 0) {
+    if (tok->type == type) advance_token(stream);
+    else if (stream->pos > 0) {
         token *prevtok = prev_token(stream);
         report(prevtok, DIAGNOSTIC_ERROR, true, stream, "%s after '%.*s'", errmsg, prevtok->len, prevtok->start);
     } else ERROR(stream, errmsg);

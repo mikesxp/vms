@@ -32,7 +32,6 @@ const char *mnemonic_str[MN_COUNT] = {
     [MN_SBC]  = "sbc",
     [MN_MUL]  = "mul",
     [MN_DIV]  = "div",
-    [MN_REM]  = "rem",
     [MN_AND]  = "and",
     [MN_OR]   = "or",
     [MN_XOR]  = "xor",
@@ -50,6 +49,7 @@ const char *mnemonic_str[MN_COUNT] = {
     [MN_CMP]  = "cmp",
     [MN_PUSH] = "push",
     [MN_POP]  = "pop",
+    [MN_ERR]  = "err",
 };
 
 // Used when a register represents a value to be stored (example: store at 0x200 the first 2 bytes of A == mov [0x200], (hword)a)
@@ -79,11 +79,11 @@ const instruction_form instruction_forms[] = {
 
     { MN_INT,  BLOCK_SYSTEM, 3, 0, IMM_VALUE(SIZE_BYTE),    none_value },
 
-    { MN_JMP,  BLOCK_FLOW,   0, 0, IMM_VALUE(SIZE_WORD),    none_value },
     { MN_CALL, BLOCK_FLOW,   1, 0, IMM_VALUE(SIZE_WORD),    none_value },
     { MN_RET,  BLOCK_FLOW,   2, 0, none_value,  none_value },
     { MN_IRET,  BLOCK_FLOW,   3, 0, none_value,  none_value },
 
+    { MN_JMP,  BLOCK_FLOW,   0, 0, IMM_VALUE(SIZE_WORD),    none_value },
     { MN_JMP,  BLOCK_FLOW,   0, 1, REG_VALUE(REG_A, false), none_value },
     { MN_JMP,  BLOCK_FLOW,   1, 1, REG_VALUE(REG_X, false), none_value },
     { MN_JMP,  BLOCK_FLOW,   2, 1, REG_VALUE(REG_Y, false), none_value },
@@ -330,8 +330,8 @@ const instruction_form instruction_forms[] = {
 };
 
 const size_t instruction_forms_count = ARRAYLEN(instruction_forms);
-void vms_emit(codegen_ctx *c, int64_t value, prim_size size) {
-    vms_emitter *emitter = c->backend->emitter;
+void sprk32_emit(codegen_ctx *c, int64_t value, prim_size size) {
+    sprk32_emitter *emitter = c->backend->emitter;
     uint32_t addr = c->current_ip - emitter->offset;
     if (addr + size >= emitter->out_size) {
         printf("error: storage limit exceeded (max is 0x%X)\n", emitter->out_size);
@@ -348,10 +348,10 @@ void vms_emit(codegen_ctx *c, int64_t value, prim_size size) {
     c->current_ip += size;
 }
 
-static void vms_instr(codegen_ctx *c, const mnemonic mnemonic, const value *value1, const value *value2, token *op_tok) {
+static void emit_instr(codegen_ctx *c, const mnemonic mnemonic, const value *value1, const value *value2, token *op_tok) {
     const instruction_form *f = NULL;
 
-    vms_emitter *emitter = c->backend->emitter;
+    sprk32_emitter *emitter = c->backend->emitter;
     mnemonic_range r = emitter->mnemonic_ranges[mnemonic];
     for (int i = r.start; i <= r.end; i++) {
         const instruction_form *currform = &instruction_forms[i];
@@ -382,7 +382,7 @@ static void vms_instr(codegen_ctx *c, const mnemonic mnemonic, const value *valu
     instr |= (f->block & 0b1111) << 4;
     instr |= (f->arg1 & 0b11) << 2;
     instr |= (f->arg2 & 0b11);
-    vms_emit(c, instr, SIZE_BYTE);
+    sprk32_emit(c, instr, SIZE_BYTE);
     emit_value(c, value1, f->value1.size);
     emit_value(c, value2, f->value2.size);
     if (emitter->max_ip != 0 && c->current_ip >= emitter->max_ip) {
@@ -391,31 +391,51 @@ static void vms_instr(codegen_ctx *c, const mnemonic mnemonic, const value *valu
             emitter->max_ip);
     }
 }
-
 static void emit_add_sub(codegen_ctx *c) {
-    eval_value(c, &c->instr->bin.lhs);
-    eval_value(c, &c->instr->bin.rhs);
+    value *lhs = &c->instr->bin.lhs;
+    value *rhs = &c->instr->bin.rhs;
+    token *tok = c->instr->bin.tok;
+    eval_value(c, lhs);
+    eval_value(c, rhs);
     bool is_add = c->instr->kind == INSTR_ADD;
-    if (value_is_number(&c->instr->bin.rhs, 1)) {
+    if (value_is_number(rhs, 1)) {
         mnemonic mn = MN_DEC;
         if (is_add) {
-            ir_instr *next_instr = vector_get(c->instrs, c->instr_index + 1);
+            ir_instr *next_instr = get_next_instr(c);
             // sp += 1
             // r0 = [sp]
-            if (value_is_simple(&c->instr->bin.lhs, VAL_SP) &&
-                value_is_number(&c->instr->bin.rhs, 1) &&
-                next_instr->kind == INSTR_LOAD && value_is_addr(&next_instr->bin.rhs, VAL_SP))
+            if (value_is_simple(lhs, VAL_SP) && next_instr->kind == INSTR_LOAD &&
+                value_is_addr(&next_instr->bin.rhs, VAL_SP))
             {
-                vms_instr(c, MN_POP, &next_instr->bin.lhs, &none_value, NULL);
+                emit_instr(c, MN_POP, &next_instr->bin.lhs, &none_value, tok);
                 c->instr_index++;
                 return;
             }
             mn = MN_INC;
         }
-        vms_instr(c, mn, &c->instr->bin.lhs, &none_value, c->instr->bin.tok);
+        emit_instr(c, mn, lhs, &none_value, tok);
         return;
     }
-    vms_instr(c, is_add ? MN_ADD : MN_SUB, &c->instr->bin.lhs, &c->instr->bin.rhs, c->instr->bin.tok);
+
+    operator_type op_type = is_add ? OPERATOR_ADD : OPERATOR_SUB;
+    if (rhs->op_type == op_type && rhs->operand->kind == VAL_FLAGS && 
+        rhs->operand->op_type == OPERATOR_BIT_AND && rhs->operand->operand->kind == VAL_EXPR &&
+        eval_expr(c, rhs->operand->operand->expr) == 1<<FLAG_CARRY)
+    {
+        value rhs1 = *rhs;
+        rhs1.op_type = OPERATOR_NONE;
+        rhs1.operand = NULL;
+        emit_instr(c, is_add ? MN_ADC : MN_SBC, lhs, &rhs1, tok);
+        return;
+    }
+    if (lhs->op_type != OPERATOR_NONE || rhs->op_type != OPERATOR_NONE) {
+        ERROR_AT(tok, c->stream, 
+                "+/- operations can only be used in the second operand with normal"
+                " or '+/- flags & carry' form (example: r0 += r1 + flags & flag@carry)");
+        return;
+    }
+
+    emit_instr(c, is_add ? MN_ADD : MN_SUB, lhs, rhs, tok);
 }
 
 static bool is_power_of_two(int n, int *shift) {
@@ -440,34 +460,34 @@ static void emit_mul_div(codegen_ctx *c) {
             return;
         }
         if (is_mul && *result == 2) {
-            vms_instr(c, MN_ADD, &c->instr->bin.lhs, &c->instr->bin.lhs, c->instr->bin.tok);
+            emit_instr(c, MN_ADD, &c->instr->bin.lhs, &c->instr->bin.lhs, c->instr->bin.tok);
             return;
         }
         if (is_power_of_two(*result, (int*)result)) {
             c->instr->bin.rhs.size = SIZE_BYTE;
-            vms_instr(c, is_mul ? MN_SHL : MN_SHR,
+            emit_instr(c, is_mul ? MN_SHL : MN_SHR,
                 &c->instr->bin.lhs, &c->instr->bin.rhs, c->instr->bin.tok);
             return;
         }
     }
-    vms_instr(c, is_mul ? MN_MUL : MN_DIV,
+    emit_instr(c, is_mul ? MN_MUL : MN_DIV,
         &c->instr->bin.lhs, &c->instr->bin.rhs, c->instr->bin.tok);
 }
 
 static inline void emit_binary(codegen_ctx *c, mnemonic mnemonic) {
     eval_value(c, &c->instr->bin.lhs);
     eval_value(c, &c->instr->bin.rhs);
-    vms_instr(c, mnemonic, &c->instr->bin.lhs, &c->instr->bin.rhs, c->instr->bin.tok);
+    emit_instr(c, mnemonic, &c->instr->bin.lhs, &c->instr->bin.rhs, c->instr->bin.tok);
 }
 
 static inline void emit_branch(codegen_ctx *c, mnemonic mnemonic, value *addr) {
     eval_value(c, addr);
-    vms_instr(c, mnemonic, addr, &none_value, NULL);
+    emit_instr(c, mnemonic, addr, &none_value, NULL);
 }
 static int64_t emit_blank_jmp(codegen_ctx *c, mnemonic mnemonic) {
     expr_node expr = {.kind = EXPR_NUMBER, .number = 0};
     value v = {.kind = VAL_EXPR, .size = SIZE_WORD, .expr = &expr};
-    vms_instr(c, mnemonic, &v, &none_value, NULL);
+    emit_instr(c, mnemonic, &v, &none_value, NULL);
     return c->current_ip - v.size;
 }
 static void resolve_blank_jmps(codegen_ctx *c, int64_t *addrs, int count) {
@@ -475,30 +495,64 @@ static void resolve_blank_jmps(codegen_ctx *c, int64_t *addrs, int count) {
     for (int i = 0; i < count; i++) {
         // Emit current ip at the addrs[i] ip
         c->current_ip = addrs[i];
-        vms_emit(c, label_addr, SIZE_WORD);
+        sprk32_emit(c, label_addr, SIZE_WORD);
     }
     c->current_ip = label_addr;
 }
-static bool check_flagop(codegen_ctx *c, bool clear, binary_instr *binary) {
-    if (!value_is_simple(&binary->lhs, VAL_FLAGS) || !value_is_simple(&binary->rhs, VAL_EXPR))
-        return false;
-    int64_t result = eval_expr(c, binary->rhs.expr);
-    if (clear) result = ~result;
-    if (result == 1<<FLAG_INTERRUPT) {
-        vms_instr(c, clear ? MN_CLI : MN_STI, &none_value, &none_value, binary->tok);
-        return true;
-    }
-    if (result == 1<<FLAG_CARRY) {
-        vms_instr(c, clear ? MN_CLC : MN_STC, &none_value, &none_value, binary->tok);
-        return true;
-    }
-    ERROR_AT(binary->tok, c->stream, "invalid flag index for flag %s", clear ? "clear" : "set");
+
+static bool single_bit_position(uint64_t x, int64_t *pos) {
+    if (x == 0 || (x & (x - 1)) != 0) return false;
+
+    *pos = __builtin_ctzll(x);
     return true;
 }
-void vms_gen_instr(codegen_ctx *c) {
+static void emit_and_or(codegen_ctx *c) {
+    bool is_and = c->instr->kind == INSTR_AND;
+    value *lhs_val = &c->instr->bin.lhs;
+    value *rhs_val = &c->instr->bin.rhs;
+    token *tok = c->instr->bin.tok;
+    bool rhs_is_expr = value_is_simple(rhs_val, VAL_EXPR);
+
+    if (value_is_simple(lhs_val, VAL_FLAGS) && rhs_is_expr) {
+        int64_t result = eval_expr(c, rhs_val->expr);
+        if (is_and) result = ~result;
+        if (result == 1<<FLAG_INTERRUPT) {
+            emit_instr(c, is_and ? MN_CLI : MN_STI, &none_value, &none_value, tok);
+            return;
+        }
+        if (result == 1<<FLAG_CARRY) {
+            emit_instr(c, is_and ? MN_CLC : MN_STC, &none_value, &none_value, tok);
+            return;
+        }
+        ERROR_AT(tok, c->stream, "invalid flag index for flag %s", is_and ? "clear" : "set");
+        return;
+    }
+
+    eval_value(c, lhs_val);
+    eval_value(c, rhs_val);
+
+    mnemonic mn = is_and ? MN_AND : MN_OR;
+    if (rhs_val->kind == VAL_EXPR) {
+        uint64_t rhs_result = rhs_val->expr->result;
+        if (single_bit_position(rhs_result, &rhs_val->expr->result)) {
+            rhs_val->size = SIZE_BYTE;
+            mn = is_and ? MN_RES : MN_SET;
+        }
+    }
+    emit_instr(c, mn, lhs_val, rhs_val, tok);
+}
+static bool updates_zero_flag(ir_instr *instr) {
+    switch(instr->kind) {
+    case INSTR_ADD: case INSTR_SUB: case INSTR_MUL: case INSTR_DIV: case INSTR_AND: 
+    case INSTR_OR:  case INSTR_XOR: case INSTR_NOT: case INSTR_SHL: case INSTR_SHR: 
+    case INSTR_ROL: case INSTR_ROR: case INSTR_CMP: return true;
+    default: return false;
+    }
+}
+void sprk32_gen_instr(codegen_ctx *c) {
     switch (c->instr->kind) {
     case INSTR_LIMIT: {
-        vms_emitter *emitter = c->backend->emitter;
+        sprk32_emitter *emitter = c->backend->emitter;
         emitter->offset = eval_expr(c, c->instr->limit.start);
         emitter->max_ip = emitter->offset + eval_expr(c, c->instr->limit.end);
         break;
@@ -512,12 +566,12 @@ void vms_gen_instr(codegen_ctx *c) {
         for (int i = 0; i < c->instr->emit.values.count; i++) {
             expr_node *expr = vector_get(&c->instr->emit.values, i);
             int64_t result = eval_expr(c, expr);
-            vms_emit(c, result, c->instr->emit.size);
+            sprk32_emit(c, result, c->instr->emit.size);
         }
         break;
     }
-    case INSTR_NOP:  vms_instr(c, MN_NOP, &none_value, &none_value, NULL); break;
-    case INSTR_HALT: vms_instr(c, MN_HLT, &none_value, &none_value, NULL); break;
+    case INSTR_NOP:  emit_instr(c, MN_NOP, &none_value, &none_value, NULL); break;
+    case INSTR_HALT: emit_instr(c, MN_HLT, &none_value, &none_value, NULL); break;
     case INSTR_CALL:
         if (c->instr->branch.type != BRANCH_NONE) {
             ERROR_AT(c->instr->branch.tok, c->stream,
@@ -664,18 +718,18 @@ void vms_gen_instr(codegen_ctx *c) {
         emit_branch(c, mnemonic, branch_addr);
         break;
     }
-    case INSTR_RET:  vms_instr(c, MN_RET, &none_value, &none_value, NULL); break;
-    case INSTR_RETI: vms_instr(c, MN_IRET, &none_value, &none_value, NULL); break;
+    case INSTR_RET:  emit_instr(c, MN_RET, &none_value, &none_value, NULL); break;
+    case INSTR_RETI: emit_instr(c, MN_IRET, &none_value, &none_value, NULL); break;
     case INSTR_LOAD: {
-        ir_instr *next_instr = vector_get(c->instrs, c->instr_index + 1);
-        value *next_rhs = &next_instr->bin.rhs;
+        ir_instr *next_instr = get_next_instr(c);
         // [sp] = r0
         // sp -= 1
         if (value_is_addr(&c->instr->bin.lhs, VAL_SP) && next_instr->kind == INSTR_SUB &&
-            value_is_simple(&next_instr->bin.lhs, VAL_SP) && value_is_simple(next_rhs, VAL_EXPR) &&
-            eval_expr(c, next_rhs->expr) == 1)
+            value_is_simple(&next_instr->bin.lhs, VAL_SP) && 
+            value_is_simple(&next_instr->bin.rhs, VAL_EXPR) &&
+            eval_expr(c, next_instr->bin.rhs.expr) == 1)
         {
-            vms_instr(c, MN_PUSH, &c->instr->bin.rhs, &none_value, NULL);
+            emit_instr(c, MN_PUSH, &c->instr->bin.rhs, &none_value, NULL);
             c->instr_index++;
             break;
         }
@@ -683,25 +737,59 @@ void vms_gen_instr(codegen_ctx *c) {
         emit_binary(c, MN_MOV);
         break;
     }
-    case INSTR_SUB: case INSTR_ADD: emit_add_sub(c); break;
+    case INSTR_ADD: case INSTR_SUB: emit_add_sub(c); break;
     case INSTR_MUL: case INSTR_DIV: emit_mul_div(c); break;
-    case INSTR_REM: vms_instr(c, MN_REM, &c->instr->bin.lhs, &c->instr->bin.rhs, NULL); break;
-    case INSTR_AND:
-        if (check_flagop(c, true, &c->instr->bin)) break;
-        emit_binary(c, MN_AND);
-        break;
-    case INSTR_OR:
-        if (check_flagop(c, false, &c->instr->bin)) break;
-        emit_binary(c, MN_OR);
-        break;
+    case INSTR_AND: case INSTR_OR:  emit_and_or(c);  break;
     case INSTR_XOR: emit_binary(c, MN_XOR); break;
     case INSTR_SHL: emit_binary(c, MN_SHL); break;
     case INSTR_SHR: emit_binary(c, MN_SHR); break;
     case INSTR_ROL: emit_binary(c, MN_ROL); break;
     case INSTR_ROR: emit_binary(c, MN_ROR); break;
-    case INSTR_CMP: emit_binary(c, MN_CMP); break;
-    case INSTR_LABEL:
-    case INSTR_COUNT: break;
+    case INSTR_NOT:
+        eval_value(c, &c->instr->unary.operand);
+        emit_instr(c, MN_NOT, &c->instr->unary.operand, NULL, c->instr->unary.tok);
+        break;
+    case INSTR_CMP: {
+        value *lhs = &c->instr->bin.lhs;
+        if (lhs->op_type == OPERATOR_BIT_AND) {
+            int next_jmp_index = c->instr_index+1;
+            ir_instr *next_jmp = vector_get(c->instrs, next_jmp_index);
+            while (next_jmp->kind != INSTR_JMP) {
+                if (next_jmp_index >= c->instrs->count) goto emit_cmp;
+                next_jmp = vector_get(c->instrs, next_jmp_index++);
+            }
+            if (next_jmp->branch.type != BRANCH_EQ && next_jmp->branch.type != BRANCH_NEQ) {
+                ERROR_AT(c->instr->bin.tok, c->stream, "'&' can only be used with '== 0' or '!= 0'");
+                break;
+            }
+            eval_value(c, &c->instr->bin.rhs);
+            if (!value_is_number(&c->instr->bin.rhs, 0)) {
+                ERROR_AT(c->instr->bin.tok, c->stream, "the value after '==' or '!=' must be 0");
+                break;
+            }
+
+            value bit_lhs = *lhs;
+            bit_lhs.op_type = OPERATOR_NONE;
+            bit_lhs.operand = NULL;
+
+            eval_value(c, &bit_lhs);
+            eval_value(c, lhs->operand);
+            emit_instr(c, MN_BIT, &bit_lhs, lhs->operand, c->instr->bin.tok);
+            break;
+        }
+        if (lhs->op_type != OPERATOR_NONE) {
+            ERROR_AT(c->instr->bin.tok, c->stream, 
+                "invalid cmp operation (the only avaiable is '&')");
+            break;
+        }
+    emit_cmp:
+        emit_binary(c, MN_CMP);
+        break;
+    }
+    case INSTR_REM:
+        emit_instr(c, MN_ERR, &c->instr->bin.lhs, &c->instr->bin.rhs, NULL); 
+        break;
+    case INSTR_LABEL: case INSTR_COUNT: break;
     }
 }
 
@@ -720,14 +808,14 @@ static void build_mnemonic_ranges(mnemonic_range mnemonic_ranges[MN_COUNT]) {
         mnemonic_ranges[mn].end = i;
     }
 }
-static inline void vms_backend_reset(codegen_ctx *c) {
-    vms_emitter *emitter = c->backend->emitter;
+static inline void sprk32_backend_reset(codegen_ctx *c) {
+    sprk32_emitter *emitter = c->backend->emitter;
     c->current_ip = 0;
     emitter->offset = 0;
     emitter->max_ip = 0;
 }
 
-void vms_backend_init(arch_backend *backend, vms_emitter *emitter) {
+void sprk32_backend_init(arch_backend *backend, sprk32_emitter *emitter) {
     build_mnemonic_ranges(emitter->mnemonic_ranges);
 
     // Create backend
@@ -736,9 +824,9 @@ void vms_backend_init(arch_backend *backend, vms_emitter *emitter) {
         .max_value_size = SIZE_WORD,
         .emitter = emitter,
         .alignment = {SIZE_BYTE, SIZE_HWORD, SIZE_HWORD, SIZE_HWORD},
-        .reset = &vms_backend_reset,
-        .gen_instr = &vms_gen_instr,
-        .emit = &vms_emit,
+        .reset = &sprk32_backend_reset,
+        .gen_instr = &sprk32_gen_instr,
+        .emit = &sprk32_emit,
     };
 }
 
@@ -792,7 +880,7 @@ static void disasm_print(disassembler *disasm, const instruction_form *form, siz
     value_free(v2);
     my_free(v2);
 }
-bool vms_disassemble(const char *file_name, FILE *out_file, const uint8_t *buffer, const size_t buffer_size) {
+bool sprk32_disassemble(const char *file_name, FILE *out_file, const uint8_t *buffer, const size_t buffer_size) {
     disassembler disasm = { .buffer = buffer, .out = out_file, .index = 0 };
     size_t last_instr_start = 0;
     int consecutive_count = 0;

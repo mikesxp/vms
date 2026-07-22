@@ -7,8 +7,8 @@
 #include <string.h>
 #include <time.h>
 
-#include "vms/backend.h"
-#include "vms/emulator.h"
+#include "sprk32/backend.h"
+#include "sprk32/emulator.h"
 #include "utils.h"
 
 #include <SDL3/SDL.h>
@@ -110,7 +110,7 @@ static command parse_line(const char *line) {
                     char *endptr = NULL;
                     cmd.number = strtoul(tokens[5], &endptr, 0);
                     if (endptr != tokens[5] + strlen(tokens[5])) {
-                        printf("[VMS] error: '%s' is not a valid number\n", tokens[5]);
+                        printf("[SPRK32] error: '%s' is not a valid number\n", tokens[5]);
                     }
                     last_token = 6;
                 } else {
@@ -119,7 +119,7 @@ static command parse_line(const char *line) {
                 }
             }
             if (token_count != last_token) {
-                printf("[VMS] error: invalid 'compile' syntax\n");
+                printf("[SPRK32] error: invalid 'compile' syntax\n");
                 cmd.error_occured = true;
             }
             goto cleanup;
@@ -134,7 +134,7 @@ static command parse_line(const char *line) {
         }
     }
 
-    printf("[VMS] error: unknown or invalid command syntax.\n");
+    printf("[SPRK32] error: unknown or invalid command syntax.\n");
     cmd.error_occured = true;
 cleanup:
     for (int i = 0; i < token_count; i++) {
@@ -147,18 +147,18 @@ cleanup:
 
 typedef struct {
     vector labels;
-    vms_emitter emitter;
+    sprk32_emitter emitter;
     arch_backend backend;
     bool running;
     bool error;
 
     char *rom_path;
     char *disk_path;
-} vms_cli;
+} sprk32_cli;
 
 static int emulator_run(const char *rom_path, const char *disk_path, bool debug_mode);
 static void spawn_cli(const char *file_path);
-static void execute_command(vms_cli *cli, command *cmd) {
+static void execute_command(sprk32_cli *cli, command *cmd) {
     if (cmd->error_occured) {
         my_free(cmd->lhs);
         my_free(cmd->rhs);
@@ -169,17 +169,17 @@ static void execute_command(vms_cli *cli, command *cmd) {
     switch (cmd->type) {
     case CMD_EXIT: cli->running = false; break;
     case CMD_OPEN: {
-        printf("[VMS] opening '%s'\n", cmd->lhs);
+        printf("[SPRK32] opening '%s'\n", cmd->lhs);
         spawn_cli(cmd->lhs);
         break;
     }
     case CMD_DISASM: {
-        printf("[VMS] disassembling '%s'\n", cmd->lhs);
+        printf("[SPRK32] disassembling '%s'\n", cmd->lhs);
         size_t size;
         uint8_t *buffer = file_to_buffer(cmd->lhs, &size);
 
         FILE *out_file = (cmd->rhs) ? file_open(cmd->rhs, "w") : stdout;
-        if (buffer && out_file && !vms_disassemble(cmd->lhs, out_file, buffer, size))
+        if (buffer && out_file && !sprk32_disassemble(cmd->lhs, out_file, buffer, size))
             cli->error = true;
         my_free(cmd->lhs);
         my_free(cmd->rhs);
@@ -189,11 +189,11 @@ static void execute_command(vms_cli *cli, command *cmd) {
         break;
     }
     case CMD_ISOK:
-        printf("[VMS] is ok? %s\n", !cli->error ? "yes" : "no");
+        printf("[SPRK32] is ok? %s\n", !cli->error ? "yes" : "no");
         if (cli->error) cli->running = false;
         break;
     case CMD_COMPILE: {
-        printf("[VMS] compiling '%s'", cmd->lhs);
+        printf("[SPRK32] compiling '%s'", cmd->lhs);
         if (cmd->rhs) printf(" to '%s'\n", cmd->rhs);
         else {
             printf(" -> (no destination specified, using default)\n");
@@ -234,7 +234,7 @@ static void execute_command(vms_cli *cli, command *cmd) {
     case CMD_DEBUG:
         debug_mode = true;
     case CMD_EMULATE:
-        printf("[VMS] starting emulation...\n");
+        printf("[SPRK32] starting emulation...\n");
         emulator_run(cli->rom_path, cli->disk_path, debug_mode);
         cli->running = false;
         break;
@@ -246,7 +246,7 @@ static void execute_command(vms_cli *cli, command *cmd) {
 
         for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
             if (!strcmp(cmd->lhs, map[i].name)) {
-                printf("[VMS] setting %s to '%s'\n", cmd->lhs, cmd->rhs);
+                printf("[SPRK32] setting %s to '%s'\n", cmd->lhs, cmd->rhs);
                 my_free(cmd->lhs);
 
                 my_free(*map[i].path); // Free old path
@@ -256,7 +256,7 @@ static void execute_command(vms_cli *cli, command *cmd) {
         }
 
         cli->error = true;
-        printf("[VMS] error: setting '%s' not found\n", cmd->lhs);
+        printf("[SPRK32] error: setting '%s' not found\n", cmd->lhs);
         break;
     }
     case CMD_UNKNOWN: cli->error = true; break;
@@ -266,7 +266,7 @@ static void execute_command(vms_cli *cli, command *cmd) {
 static const char *default_rom_path = "rom.bin";
 static const char *default_disk_path = "disk.bin";
 
-static void execute_file(vms_cli *cli, FILE *file) {
+static void execute_file(sprk32_cli *cli, FILE *file) {
     if (!file) return;
     while (cli->running) {
         char *line = file_read_line(file);
@@ -280,7 +280,7 @@ static void execute_file(vms_cli *cli, FILE *file) {
 static void spawn_cli(const char *file_path) {
     size_t rom_path_len = strlen(default_rom_path) + 1;
     size_t disk_path_len = strlen(default_disk_path) + 1;
-    vms_cli cli = {
+    sprk32_cli cli = {
         .rom_path = my_malloc(rom_path_len),
         .disk_path = my_malloc(disk_path_len),
         .running = true,
@@ -290,14 +290,14 @@ static void spawn_cli(const char *file_path) {
     string_copy(cli.rom_path, default_rom_path, rom_path_len);
     string_copy(cli.disk_path, default_disk_path, disk_path_len);
     vector_init(&cli.labels);
-    vms_backend_init(&cli.backend, &cli.emitter);
+    sprk32_backend_init(&cli.backend, &cli.emitter);
 
-    FILE *f = fopen(file_path ? file_path : "vms.cfg", "r");
+    FILE *f = fopen(file_path ? file_path : "sprk32.cfg", "r");
     execute_file(&cli, f);
     if (file_path) goto cleanup;
 
     while (cli.running) {
-        printf("vms> ");
+        printf("sprk32> ");
         fflush(stdout);
 
         char *input = read_line();
@@ -387,11 +387,11 @@ static int emulator_run(const char *rom_path, const char *disk_path, bool debug_
     uint8_t *dirty_disk = my_malloc(FDC_DISK_SIZE);
     FILE *disk_file = fopen(disk_path, "wb");
 
-    emulator vms = emu_init(rom, disk, debug_mode);
+    emulator sprk32 = emu_init(rom, disk, debug_mode);
 
     // Init app
     emu_ctx ctx = {};
-    SDL_SetAppMetadata("VMS", "1.0", "com.retrogic.vms");
+    SDL_SetAppMetadata("SPRK32", "1.0", "com.retrogic.sprk32");
 
     // Init video
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
@@ -400,7 +400,7 @@ static int emulator_run(const char *rom_path, const char *disk_path, bool debug_
     }
 
     // Create the window
-    if (!SDL_CreateWindowAndRenderer("VMS", SCREEN_WIDTH * 4,
+    if (!SDL_CreateWindowAndRenderer("SPRK32", SCREEN_WIDTH * 4,
                     SCREEN_HEIGHT * 4, SDL_WINDOW_RESIZABLE,
                     &ctx.window, &ctx.renderer)) {
         SDL_Log("Couldn't create window and renderer: %s", SDL_GetError());
@@ -444,7 +444,7 @@ static int emulator_run(const char *rom_path, const char *disk_path, bool debug_
             case SDL_EVENT_KEY_DOWN:
                 switch (e.key.key) {
                 case SDLK_ESCAPE:
-                    set_flag(&vms.cpu, FLAG_HALTED, true);
+                    set_flag(&sprk32.cpu, FLAG_HALTED, true);
                     run = false;
                     break;
                 default: break;
@@ -452,7 +452,7 @@ static int emulator_run(const char *rom_path, const char *disk_path, bool debug_
                 break;
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             case SDL_EVENT_QUIT:
-                set_flag(&vms.cpu, FLAG_HALTED, true);
+                set_flag(&sprk32.cpu, FLAG_HALTED, true);
                 run = false;
                 break;
             default: break;
@@ -470,28 +470,28 @@ static int emulator_run(const char *rom_path, const char *disk_path, bool debug_
         while (cycle_accumulator >= 1.0) {
             uint64_t start = now_ns();
 
-            uint64_t start_cycles = vms.cpu.cycles;
-            if (!dma_step(&vms.dma, &vms.cpu.cycles))
-                cpu_step(&vms.cpu);
+            uint64_t start_cycles = sprk32.cpu.cycles;
+            if (!dma_step(&sprk32.dma, &sprk32.cpu.cycles))
+                cpu_step(&sprk32.cpu);
 
-            uint64_t used = vms.cpu.cycles - start_cycles;
+            uint64_t used = sprk32.cpu.cycles - start_cycles;
             cpu_exec_time_ns += now_ns() - start;
 
             cycle_accumulator -= used;
             sec_cycles += used;
             instr_per_sec++;
 
-            vpu_tick(&vms.vpu, used);
+            vpu_tick(&sprk32.vpu, used);
 
-            if (get_flag(&vms.cpu, FLAG_HALTED)) {
+            if (get_flag(&sprk32.cpu, FLAG_HALTED)) {
                 run = false;
                 break;
             }
         }
 
-        if (vms.vpu.frame_completed) {
-            vms.vpu.frame_completed = false;
-            render(&ctx, &vms.vpu);
+        if (sprk32.vpu.frame_completed) {
+            sprk32.vpu.frame_completed = false;
+            render(&ctx, &sprk32.vpu);
             frame_counter++;
 
             uint64_t time_now = now_ns();
@@ -528,7 +528,7 @@ static int emulator_run(const char *rom_path, const char *disk_path, bool debug_
     my_free(dirty_disk);
 
     // Free emulator
-    emu_free(&vms);
+    emu_free(&sprk32);
     SDL_DestroyTexture(ctx.screen);
     SDL_DestroyRenderer(ctx.renderer);
     SDL_DestroyWindow(ctx.window);

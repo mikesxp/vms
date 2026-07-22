@@ -17,18 +17,28 @@ typedef struct {
     void (*gen_instr)(struct codegen_ctx *c);
     void (*emit)(struct codegen_ctx *c, int64_t value, prim_size size);
 } arch_backend;
-struct instr;
+struct ir_instr;
 struct codegen_ctx {
     token_stream *stream;
     arch_backend *backend;
     vector *instrs;
-    struct instr *instr;
+    struct ir_instr *instr;
     size_t instr_index;
     uint64_t current_ip;
 };
+static inline struct ir_instr *get_next_instr(codegen_ctx *c) {
+    return vector_get(c->instrs, c->instr_index+1);
+}
 
 struct value;
+bool value_matches(const struct value *actual, const struct value *expected);
+void print_value(FILE *out, const struct value *value, bool show_imm);
+void print_values(FILE *out, const struct value *value1, const struct value *value2, bool show_imm);
+
 void emit_value(codegen_ctx *c, const struct value *value, prim_size size);
+void eval_value(codegen_ctx *c, struct value *value);
+struct expr_node;
+int64_t eval_expr(codegen_ctx *c, struct expr_node *expr);
 
 bool compile(vector *files, arch_backend *backend, vector *shared_labels);
 void labels_free(vector *labels);

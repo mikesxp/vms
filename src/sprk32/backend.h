@@ -38,7 +38,6 @@ typedef enum {
 
     MN_MUL,
     MN_DIV,
-    MN_REM,
 
     MN_AND,
     MN_OR,
@@ -60,6 +59,7 @@ typedef enum {
 
     MN_PUSH,
     MN_POP,
+    MN_ERR,
 
     MN_CMP,
     MN_COUNT,
@@ -73,10 +73,10 @@ typedef struct {
     uint8_t *out;
     uint32_t out_size;
     uint32_t offset, max_ip;
-} vms_emitter;
-void vms_emit(codegen_ctx *c, int64_t value, prim_size size);
-void vms_backend_init(arch_backend *backend, vms_emitter *emitter);
-bool vms_disassemble(const char *file_name, FILE *out_file, const uint8_t *buffer, const size_t buffer_size);
+} sprk32_emitter;
+void sprk32_emit(codegen_ctx *c, int64_t value, prim_size size);
+void sprk32_backend_init(arch_backend *backend, sprk32_emitter *emitter);
+bool sprk32_disassemble(const char *file_name, FILE *out_file, const uint8_t *buffer, const size_t buffer_size);
 
 typedef struct {
     mnemonic mn;

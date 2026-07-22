@@ -18,48 +18,50 @@ typedef struct {
     bool used;
 } register_state;
 typedef struct {
-    arch_backend *backend;
-    token_stream *stream;
     register_state *register_states;
     label *current_label;
-    hashmap *layouts;
-    vector *shared_labels; // Vector of label*
-    vector *deleted_layouts;
-    vector *instrs;
+    frontend_shared *shared;
 
     uint64_t label_count;
     enum { PARSE_NONE, PARSE_ROUTINE, PARSE_LABEL } parse_mode;
-    vector unresolved_labels; // Vector of unresolved_label*
-} parser;
+    bool parsing_relop; // Relational operators (only in if stmt)
+    vector unresolved_labels; // Vector of unresolved_label
+} frontend_ctx;
 
-static inline ir_instr *instr_new(ir_instr_kind kind, parser *p) {
+static inline ir_instr *instr_new(ir_instr_kind kind, frontend_ctx *ctx) {
     ir_instr *instr = my_malloc(sizeof *instr);
     *instr = (ir_instr){kind};
     return instr;
 }
-static expr_node *expr_new(expr_kind kind) {
+static inline expr_node *expr_new(expr_kind kind) {
     expr_node *n = my_malloc(sizeof(*n));
     n->kind = kind;
     return n;
 }
-static ir_instr *label_jump_new(label *label, branch_type type, parser *p) {
-    ir_instr *instr = instr_new(INSTR_JMP, p);
+static inline expr_node *expr_number(int value, token *tok) {
+    expr_node *n = expr_new(EXPR_NUMBER);
+    n->number = value;
+    n->tok = tok;
+    return n;
+}
+static ir_instr *label_jump_new(label *label, branch_type type, frontend_ctx *ctx) {
+    ir_instr *instr = instr_new(INSTR_JMP, ctx);
     instr->branch.type = type;
     instr->branch.addr = (value){.kind = VAL_EXPR, .expr = expr_new(EXPR_LABEL)};
     instr->branch.addr.expr->label = label;
     return instr;
 }
-static ir_instr *indexed_label_new(parser *p) {
-    ir_instr *instr = instr_new(INSTR_LABEL, p);
+static ir_instr *indexed_label_new(frontend_ctx *ctx) {
+    ir_instr *instr = instr_new(INSTR_LABEL, ctx);
     instr->label = my_malloc(sizeof *instr->label);
-    instr->label->index = p->label_count++;
+    instr->label->index = ctx->label_count++;
     instr->label->type = LABEL_INDEXED;
     instr->label->instr = instr;
     return instr;
 }
 
-static inline void unexpected_token(parser *p) {
-    token *tok = current_token(p->stream);
+static inline void unexpected_token(frontend_ctx *ctx) {
+    token *tok = current_token(ctx->shared->stream);
     const char *kind = "tok";
     if (tok->type == TOK_IDENT)    kind = "identifier";
     else if (tok->type == TOK_NUM) kind = "number";
@@ -73,37 +75,26 @@ static inline void unexpected_token(parser *p) {
         kind = "symbol";
     else if (tok->type >= TOK_SPECIAL_START && tok->type < TOK_SPECIAL_END)
         kind = "special";
-    token *prev = prev_token(p->stream);
-    ERROR(p->stream, "unexpected %s after '%.*s'", kind, prev->len, prev->start);
+    token *prev = prev_token(ctx->shared->stream);
+    ERROR(ctx->shared->stream, "unexpected %s after '%.*s'", kind, prev->len, prev->start);
 }
 
-bool token_is_register(uint8_t *index, token *tok, parser *p) {
+bool token_is_register(uint8_t *index, token *tok, frontend_ctx *ctx) {
+    return false;
+}
+bool read_register(uint8_t *index, frontend_ctx *ctx) {
+    token *tok = current_token(ctx->shared->stream);
     if (tok->type != TOK_IDENT) return false;
-    for (uint8_t i = 0; i < p->backend->register_count; i++) {
-        register_state *reg = &p->register_states[i];
+    for (uint8_t i = 0; i < ctx->shared->backend->register_count; i++) {
+        register_state *reg = &ctx->register_states[i];
         char reg_name[5];
         snprintf(reg_name, ARRAYLEN(reg_name), "r%u", i);
 
         if (token_is_str(tok, reg_name)) {
+            advance_token(ctx->shared->stream);
             if (index) *index = i;
             return true;
         }
-    }
-    return false;
-}
-bool read_register(uint8_t *index, bool *is_sp, parser *p) {
-    if (match_token(TOK_SP, p->stream)) {
-        if (is_sp) {
-            *is_sp = true;
-            return true;
-        }
-        EXPECT_PREV(p->stream, "sp is a special register, expected rN format");
-        return false;
-    }
-
-    if (token_is_register(index, current_token(p->stream), p)) {
-        advance_token(p->stream);
-        return true;
     }
     return false;
 }
@@ -117,8 +108,8 @@ static prim_size size_from_string(char *str, size_t strlen) {
     return -1;
 }
 
-static token *parse_type(register_type *type, parser *p) {
-    token *type_tok = current_token(p->stream);
+static token *parse_type(register_type *type, frontend_ctx *ctx) {
+    token *type_tok = current_token(ctx->shared->stream);
     if (type_tok->type != TOK_IDENT && type_tok->type != TOK_NUM) return NULL;
 
     register_sign sign = (*type_tok->start == 's') ? SIGN_SIGNED :
@@ -129,154 +120,174 @@ static token *parse_type(register_type *type, parser *p) {
     if (size == -1) return NULL;
 
     *type = (register_type){size, sign};
-    advance_token(p->stream);
+    advance_token(ctx->shared->stream);
     return type_tok;
 }
 
-static inline void reset_registers(parser *p) {
-    for (uint8_t i = 0; i < p->backend->register_count; i++) {
-        p->register_states[i].type = (register_type){.sign = SIGN_NONE, .size = SIZE_NONE};
-        p->register_states[i].used = false;
+static inline void reset_registers(frontend_ctx *ctx) {
+    for (uint8_t i = 0; i < ctx->shared->backend->register_count; i++) {
+        ctx->register_states[i].type = (register_type){.sign = SIGN_NONE, .size = SIZE_NONE};
+        ctx->register_states[i].used = false;
     }
 }
-static bool parse_use(parser *p) {
-    bool is_unuse = match_token(TOK_UNUSE, p->stream);
-    if (!is_unuse && !match_token(TOK_USE, p->stream)) return false;
-    if (p->parse_mode == PARSE_NONE) {
-        ERROR_AT(prev_token(p->stream), p->stream, "'use'/'unuse' can only be used under a label");
+static bool parse_use(frontend_ctx *ctx) {
+    bool is_unuse = match_token(TOK_UNUSE, ctx->shared->stream);
+    if (!is_unuse && !match_token(TOK_USE, ctx->shared->stream)) return false;
+    if (ctx->parse_mode == PARSE_NONE) {
+        ERROR_AT(prev_token(ctx->shared->stream), ctx->shared->stream, "'use'/'unuse' can only be used under a label");
         return true;
     }
 
-    p->current_label->is_word = true;
-    p->parse_mode = PARSE_ROUTINE;
-    if (match_token(TOK_ALL, p->stream)) {
+    ctx->current_label->is_word = true;
+    ctx->parse_mode = PARSE_ROUTINE;
+    if (match_token(TOK_ALL, ctx->shared->stream)) {
         if (is_unuse) {
-            p->parse_mode = PARSE_NONE;
-            reset_registers(p);
+            ctx->parse_mode = PARSE_NONE;
+            reset_registers(ctx);
             return true;
         }
         register_type type = {SIZE_NONE, SIGN_NONE};
-        parse_type(&type, p);
-        for (int i = 0; i < p->backend->register_count; i++) {
-            p->register_states[i].used = true;
-            p->register_states[i].type = type;
+        parse_type(&type, ctx);
+        for (int i = 0; i < ctx->shared->backend->register_count; i++) {
+            ctx->register_states[i].used = true;
+            ctx->register_states[i].type = type;
         }
         return true;
     }
 
     for (;;) {
         uint8_t reg = 0;
-        if (!read_register(&reg, NULL, p)) {
-            token *tok = current_token(p->stream);
-            ERROR_AT(tok, p->stream, "'%.*s' is not a register", tok->len, tok->start);
+        if (!read_register(&reg, ctx)) {
+            token *tok = current_token(ctx->shared->stream);
+            ERROR_AT(tok, ctx->shared->stream, "'%.*s' is not a register", tok->len, tok->start);
             return true;
         }
-        p->register_states[reg].used = !is_unuse;
-        if (!is_unuse) parse_type(&p->register_states[reg].type, p);
-        if (!match_token(TOK_COMMA, p->stream)) break;
+        ctx->register_states[reg].used = !is_unuse;
+        if (!is_unuse) parse_type(&ctx->register_states[reg].type, ctx);
+        if (!match_token(TOK_COMMA, ctx->shared->stream)) break;
     }
     return true;
 }
 
-static inline bool consume_expression(expr_node **out, parser *p);
-static inline layout_field *check_layout_index(int64_t index, token *field_tok, token *layoutok, layout *layout, parser *p) {
+static inline bool consume_expression(expr_node **out, frontend_ctx *ctx);
+static inline layout_field *check_layout_index(int64_t index, token *field_tok, token *layoutok, layout *layout, frontend_ctx *ctx) {
     if (index < layout->fields.count) return vector_get(&layout->fields, index);
-    ERROR_AT(field_tok, p->stream,
+    ERROR_AT(field_tok, ctx->shared->stream,
         "field index '%.*s' out of bounds for layout '%.*s' (%d field available)",
             field_tok->len, field_tok->start, layoutok->len, layoutok->start,
             layout->fields.count);
     return NULL;
 }
-static layout_field *find_layout_field(parser *p, token *field_tok, token *layoutok, layout *layout) {
+static layout_field *find_layout_field(frontend_ctx *ctx, token *field_tok, token *layoutok, layout *layout) {
     if (!field_tok) return NULL;
     if (field_tok->type == TOK_NUM)
-        return check_layout_index(field_tok->number, field_tok, layoutok, layout, p);
+        return check_layout_index(field_tok->number, field_tok, layoutok, layout, ctx);
     for (int i = 0; i < layout->fields.count; i++) {
         layout_field *field = vector_get(&layout->fields, i);
         if (tokens_equal(field->name, field_tok)) return field;
     }
-    ERROR_AT(field_tok, p->stream,
+    ERROR_AT(field_tok, ctx->shared->stream,
         "no field named '%.*s' in layout '%.*s'",
         field_tok->len, field_tok->start,
         layoutok->len, layoutok->start);
     return NULL;
 }
-static bool parse_expr(expr_node **out, int min_prec, parser *p);
-static inline bool resolve_expression(expr_node **out, parser *p) {
-    return parse_expr(out, 0, p);
+static bool parse_expr(expr_node **out, int min_prec, frontend_ctx *ctx);
+static inline bool resolve_expression(expr_node **out, frontend_ctx *ctx) {
+    return parse_expr(out, 0, ctx);
 }
-static bool read_layout_value(expr_node **out, parser *p) {
-    token *sizeof_tok = match_token(TOK_SIZEOF, p->stream);
+static bool read_layout_value(expr_node **out, frontend_ctx *ctx) {
+    token *sizeof_tok = match_token(TOK_SIZEOF, ctx->shared->stream);
 
-    token *tok = current_token(p->stream);
+    token *tok = current_token(ctx->shared->stream);
     if (tok->type != TOK_IDENT) {
-        if (sizeof_tok) EXPECT(p->stream, "expected layout name after 'sizeof'");
+        if (sizeof_tok) EXPECT(ctx->shared->stream, "expected layout name after 'sizeof'");
         return false;
     }
-    layout *layout = hashmap_get(p->layouts, tok->start, tok->len);
+    layout *layout = hashmap_get(&ctx->shared->layouts, tok->start, tok->len);
     if (!layout) {
         if (sizeof_tok)
-            ERROR_AT(tok, p->stream, "'%.*s' is not a valid layout name", tok->len, tok->start);
+            ERROR_AT(tok, ctx->shared->stream, "'%.*s' is not a valid layout name", tok->len, tok->start);
         return false;
     }
-    advance_token(p->stream);
+    advance_token(ctx->shared->stream);
 
     token *field_tok = NULL;
-    if (match_token(TOK_COMMERCIAL_AT, p->stream)) {
-        field_tok = current_token(p->stream);
+    if (match_token(TOK_COMMERCIAL_AT, ctx->shared->stream)) {
+        field_tok = current_token(ctx->shared->stream);
         if (field_tok->type != TOK_IDENT && field_tok->type != TOK_NUM) {
-            EXPECT_PREV(p->stream, "expected field name or index");
+            EXPECT_PREV(ctx->shared->stream, "expected field name or index");
             return true;
         }
-        advance_token(p->stream);
+        advance_token(ctx->shared->stream);
     }
     expr_node *n = expr_new(EXPR_LAYOUT);
-    n->layout.field = find_layout_field(p, field_tok, tok, layout);
+    n->layout.field = find_layout_field(ctx, field_tok, tok, layout);
     n->layout.is_sizeof = sizeof_tok;
     n->layout.value = layout;
     n->layout.index = NULL;
     n->tok = tok;
     *out = n;
 
-    if (match_token(TOK_LSQUARE, p->stream)) {
-        if (!resolve_expression(&n->layout.index, p)) {
-            p->stream->pos--;
+    if (match_token(TOK_LSQUARE, ctx->shared->stream)) {
+        if (!resolve_expression(&n->layout.index, ctx)) {
+            ctx->shared->stream->pos--;
             return true;
         }
         if (field_tok) {
-            consume_token(TOK_RSQUARE, "expected ']'", p->stream);
+            consume_token(TOK_RSQUARE, "expected ']'", ctx->shared->stream);
             return true;
         }
 
-        ERROR_AT(prev_token(p->stream), p->stream, "indexing can only be used with a layout field");
+        ERROR_AT(prev_token(ctx->shared->stream), ctx->shared->stream, "indexing can only be used with a layout field");
     }
     return true;
 }
-static bool parse_factor(expr_node **out, parser *p) {
-    if (match_token(TOK_LPAREN, p->stream))
-        return parse_expr(out, 0, p) && consume_token(TOK_RPAREN, "expected ')'", p->stream);
-    token *num_tok = match_token(TOK_NUM, p->stream);
+static bool read_bitset_value(expr_node **out, frontend_ctx *ctx) {
+    token *setname = current_token(ctx->shared->stream);
+    if (setname->type != TOK_IDENT) return false;
+    bitset *bitset = hashmap_get(&ctx->shared->bitsets, setname->start, setname->len);
+    if (!bitset) return false;
+    advance_token(ctx->shared->stream);
+    consume_token(TOK_COMMERCIAL_AT, "expected '@'", ctx->shared->stream);
+    token *bit_name = consume_token(TOK_IDENT, "expected bit name", ctx->shared->stream);
+    for (int i = 0; i < bitset->bits.count; i++) {
+        bitdef *def = vector_get(&bitset->bits, i);
+        if (tokens_equal(bit_name, def->name)) {
+            expr_node *n = expr_new(EXPR_BITSET);
+            n->bitset.set = bitset;
+            n->bitset.bit = def;
+            n->tok = setname;
+            *out = n;
+            return true;
+        }
+    }
+    ERROR(ctx->shared->stream, "no field named '%.*s' in bitset '%.*s'", bit_name->len, bit_name->start, setname->len, setname->start);
+    return true;
+}
+static bool parse_expr_factor(expr_node **out, frontend_ctx *ctx) {
+    if (match_token(TOK_LPAREN, ctx->shared->stream))
+        return parse_expr(out, 0, ctx) && consume_token(TOK_RPAREN, "expected ')'", ctx->shared->stream);
+    token *num_tok = match_token(TOK_NUM, ctx->shared->stream);
     if (num_tok) {
-        *out = expr_new(EXPR_NUMBER);
-        (*out)->number = num_tok->number;
-        (*out)->tok = num_tok;
+        *out = expr_number(num_tok->number, num_tok);
         return true;
     }
-    if (read_layout_value(out, p)) return true;
-    if (next_token(p->stream)->type == TOK_COMMERCIAL_AT) {
-        token *layout_name = current_token(p->stream);
-        ERROR_AT(layout_name, p->stream, "layout '%.*s' is undefined", layout_name->len, layout_name->start);
+    if (read_layout_value(out, ctx) || read_bitset_value(out, ctx)) return true;
+    if (next_token(ctx->shared->stream)->type == TOK_COMMERCIAL_AT) {
+        token *layout_name = current_token(ctx->shared->stream);
+        ERROR_AT(layout_name, ctx->shared->stream, "layout/bitset '%.*s' is undefined", layout_name->len, layout_name->start);
         return false;
     }
-    token *label_name = current_token(p->stream);
+    token *label_name = current_token(ctx->shared->stream);
+    if (token_is_register(NULL, label_name, ctx)) return false;
     if (label_name->type == TOK_IDENT) {
-        if (token_is_register(NULL, label_name, p)) return false;
-        advance_token(p->stream);
+        advance_token(ctx->shared->stream);
 
         *out = expr_new(EXPR_LABEL);
         (*out)->tok = label_name;
-        for (int i = 0; i < p->shared_labels->count; i++) {
-            label *label = vector_get(p->shared_labels, i);
+        for (int i = 0; i < ctx->shared->labels->count; i++) {
+            label *label = vector_get(ctx->shared->labels, i);
             if (label->type == LABEL_NAMED && token_is_str(label_name, label->name)) {
                 (*out)->label = label;
                 return true;
@@ -284,16 +295,16 @@ static bool parse_factor(expr_node **out, parser *p) {
         }
         unresolved_label *unresolved_lb = my_malloc(sizeof *unresolved_lb);
         *unresolved_lb = (unresolved_label){
-            .dest = &(*out)->label, .parent = p->current_label, .tok = label_name
+            .dest = &(*out)->label, .parent = ctx->current_label, .tok = label_name
         };
-        vector_add(&p->unresolved_labels, unresolved_lb);
+        vector_add(&ctx->unresolved_labels, unresolved_lb);
         return true;
     }
     return false;
 }
-static bool parse_unary(expr_node **out, parser *p) {
+static bool parse_expr_unary(expr_node **out, frontend_ctx *ctx) {
     *out = NULL;
-    token *tok = current_token(p->stream);
+    token *tok = current_token(ctx->shared->stream);
     operator_type op = OPERATOR_NONE;
     switch (tok->type) {
         case TOK_MINUS: op = OPERATOR_UNARY_MINUS; break;
@@ -310,11 +321,11 @@ static bool parse_unary(expr_node **out, parser *p) {
             else if (token_is_str(tok, "sign")) op = OPERATOR_SIGN;
             else if (token_is_str(tok, "ceil")) op = OPERATOR_CEIL;
             else if (token_is_str(tok, "floor")) op = OPERATOR_FLOOR;
-            else return parse_factor(out, p);
+            else return parse_expr_factor(out, ctx);
     }
-    advance_token(p->stream);
+    advance_token(ctx->shared->stream);
     expr_node *expr;
-    if (!parse_unary(&expr, p)) return false;
+    if (!parse_expr_unary(&expr, ctx)) return false;
     *out = expr_new(EXPR_UNARY);
     (*out)->unary.expr = expr;
     (*out)->unary.op = op;
@@ -360,38 +371,40 @@ static inline operator_type token_to_basic_binop(token *tok) {
     default:        return OPERATOR_NONE;
     }
 }
-static inline operator_type token_to_binop(token *tok) {
+static inline operator_type token_to_binop(token *tok, frontend_ctx *ctx) {
     operator_type op = token_to_basic_binop(tok);
     if (op != OPERATOR_NONE) return op;
-    switch (tok->type) {
-    case TOK_LESS:          return OPERATOR_LT;
-    case TOK_LESS_EQUAL:    return OPERATOR_LE;
-    case TOK_EQUAL_EQUAL:   return OPERATOR_EQ;
-    case TOK_BANG_EQUAL:    return OPERATOR_NEQ;
-    case TOK_GREATER:       return OPERATOR_GT;
-    case TOK_GREATER_EQUAL: return OPERATOR_GE;
-    case TOK_AND_AND:       return OPERATOR_LOGIC_AND;
-    case TOK_OR_OR:         return OPERATOR_LOGIC_OR;
-    default:
-        if (token_is_str(tok, "pow")) return OPERATOR_POW;
-        if (token_is_str(tok, "min")) return OPERATOR_MIN;
-        if (token_is_str(tok, "max")) return OPERATOR_MAX;
-        if (token_is_str(tok, "mod")) return OPERATOR_MOD;
-        return OPERATOR_NONE;
+    if (!ctx->parsing_relop) {
+        switch (tok->type) {
+        case TOK_LESS:          return OPERATOR_LT;
+        case TOK_LESS_EQUAL:    return OPERATOR_LE;
+        case TOK_EQUAL_EQUAL:   return OPERATOR_EQ;
+        case TOK_BANG_EQUAL:    return OPERATOR_NEQ;
+        case TOK_GREATER:       return OPERATOR_GT;
+        case TOK_GREATER_EQUAL: return OPERATOR_GE;
+        default: break;
+        }
     }
+    if (tok->type == TOK_AND_AND) return OPERATOR_LOGIC_AND;
+    if (tok->type == TOK_OR_OR)   return OPERATOR_LOGIC_OR;
+    if (token_is_str(tok, "pow")) return OPERATOR_POW;
+    if (token_is_str(tok, "min")) return OPERATOR_MIN;
+    if (token_is_str(tok, "max")) return OPERATOR_MAX;
+    if (token_is_str(tok, "mod")) return OPERATOR_MOD;
+    return OPERATOR_NONE;
 }
-static bool parse_expr(expr_node **out, int min_prec, parser *p) {
-    if (!parse_unary(out, p)) return false;
+static bool parse_expr(expr_node **out, int min_prec, frontend_ctx *ctx) {
+    if (!parse_expr_unary(out, ctx)) return false;
     for (;;) {
-        token *op_tok = current_token(p->stream);
-        operator_type op = token_to_binop(op_tok);
+        token *op_tok = current_token(ctx->shared->stream);
+        operator_type op = token_to_binop(op_tok, ctx);
 
         int prec = precedence(op);
         if (prec < min_prec) return true;
-        advance_token(p->stream);
+        advance_token(ctx->shared->stream);
 
         expr_node *rhs = NULL;
-        if (!parse_expr(&rhs, prec + 1, p)) return false;
+        if (!parse_expr(&rhs, prec + 1, ctx)) return false;
 
         expr_node *lhs = *out;
         *out = expr_new(EXPR_BINARY);
@@ -400,119 +413,109 @@ static bool parse_expr(expr_node **out, int min_prec, parser *p) {
         (*out)->binary.op = op;
     }
 }
-static inline bool consume_expression(expr_node **out, parser *p) {
-    if (resolve_expression(out, p)) return true;
+static inline bool consume_expression(expr_node **out, frontend_ctx *ctx) {
+    if (resolve_expression(out, ctx)) return true;
     expr_free(*out);
     *out = NULL;
-    token *currtok = current_token(p->stream);
-    EXPECT_PREV(p->stream, "expected expression before '%.*s'", currtok->len, currtok->start);
+    token *currtok = current_token(ctx->shared->stream);
+    EXPECT_PREV(ctx->shared->stream, "expected expression before '%.*s'", currtok->len, currtok->start);
     return false;
 }
 
-static inline bool consume_value(value *val, parser *p);
-static inline ir_instr *instr_incdec(value *val, bool is_dec, token *tok, parser *p) {
-    ir_instr *instr = instr_new(is_dec ? INSTR_SUB : INSTR_ADD, p);
-    instr->bin.lhs = *val;
-    instr->bin.lhs.is_addr = false;
-    instr->bin.rhs = (value){
-        .kind = VAL_EXPR, .is_addr = false, .size = SIZE_BYTE,
-        .expr = expr_new(EXPR_NUMBER)
-    };
-    instr->bin.rhs.expr->number = 1;
-    instr->bin.tok = tok;
-    return instr;
-}
-static bool parse_raw_value(value *val, parser *p) {
+static inline bool consume_value(value *val, frontend_ctx *ctx);
+static bool parse_raw_value(value *val, frontend_ctx *ctx) {
     val->op_type = OPERATOR_NONE;
     val->operand = NULL;
-    bool is_sp = false;
-    if (match_token(TOK_FLAGS, p->stream)) {
+    if (match_token(TOK_FLAGS, ctx->shared->stream)) {
         val->kind = VAL_FLAGS;
         return true;
     }
-    if (read_register(&val->reg.index, &is_sp, p)) {
-        if (!is_sp) {
-            if (!p->register_states[val->reg.index].used) {
-                ERROR_AT(prev_token(p->stream), p->stream,
-                    "'r%d' is missing a declaration", val->reg.index);
-                return true;
-            }
-
-            register_type t = p->register_states[val->reg.index].type;
-            val->kind = VAL_REG;
-            val->reg.sign = t.sign;
-            val->size = t.size;
-        } else val->kind = VAL_SP;
+    if (match_token(TOK_SP, ctx->shared->stream)) {
+        val->kind = VAL_SP;
         return true;
     }
-    if (resolve_expression(&val->expr, p)) {
+    if (read_register(&val->reg.index, ctx)) {
+        if (!ctx->register_states[val->reg.index].used) {
+            ERROR_AT(prev_token(ctx->shared->stream), ctx->shared->stream,
+                "'r%d' is missing a declaration", val->reg.index);
+            return true;
+        }
+
+        register_type t = ctx->register_states[val->reg.index].type;
+        val->kind = VAL_REG;
+        val->reg.sign = t.sign;
+        val->size = t.size;
+        return true;
+    }
+    if (resolve_expression(&val->expr, ctx)) {
         val->kind = VAL_EXPR;
         return true;
     }
-    if (val->is_addr) EXPECT(p->stream, "expected an address expression after '['");
+    if (val->is_addr) EXPECT(ctx->shared->stream, "expected an address expression after '['");
     return false;
 }
-static bool parse_value(value *val, parser *p) {
-    val->is_addr = match_token(TOK_LSQUARE, p->stream);
-    if (!parse_raw_value(val, p)) return false;
+static bool parse_value(value *val, frontend_ctx *ctx) {
+    val->is_addr = match_token(TOK_LSQUARE, ctx->shared->stream);
+    if (!parse_raw_value(val, ctx)) return false;
 
-    if (match_token(TOK_AS, p->stream)) {
+    if (match_token(TOK_AS, ctx->shared->stream)) {
         if (val->kind != VAL_REG) {
-            ERROR_AT(prev_token(p->stream), p->stream,
-                "'as' can only be used with registers", p->stream);
+            ERROR_AT(prev_token(ctx->shared->stream), ctx->shared->stream,
+                "'as' can only be used with registers", ctx->shared->stream);
             return true;
         }
         register_type type = {SIZE_NONE, SIGN_NONE};
-        if (!parse_type(&type, p)) {
-            EXPECT_PREV(p->stream, "expected type after 'as'", p->stream);
+        if (!parse_type(&type, ctx)) {
+            EXPECT_PREV(ctx->shared->stream, "expected type after 'as'", ctx->shared->stream);
             return true;
         }
         val->reg.sign = type.sign;
         val->size = type.size;
     }
-    token *tok = current_token(p->stream);
+    token *tok = current_token(ctx->shared->stream);
     operator_type op = token_to_basic_binop(tok);
     if (op != OPERATOR_NONE) {
-        advance_token(p->stream);
+        advance_token(ctx->shared->stream);
         val->operand = my_malloc(sizeof *val->operand);
         val->op_type = op;
-        consume_value(val->operand, p);
+        consume_value(val->operand, ctx);
     }
-    if (val->is_addr && !match_token(TOK_RSQUARE, p->stream))
-        EXPECT(p->stream, "expected ']'", p->stream);
+    if (val->is_addr)
+        consume_token(TOK_RSQUARE, "expected ']'", ctx->shared->stream);
     return true;
 }
-static inline bool consume_value(value *val, parser *p) {
-    if (parse_value(val, p)) return true;
-    unexpected_token(p);
+static inline bool consume_value(value *val, frontend_ctx *ctx) {
+    if (parse_value(val, ctx)) return true;
+    ERROR(ctx->shared->stream, "expected a value");
     return false;
 }
-static void parse_instr(parser *p);
-static inline bool report_unclosed_block(parser *p, token *start_tok) {
-    if (p->stream->error_occured) return true;
-    bool result = at_end(p->stream);
+static void parse_instr(frontend_ctx *ctx);
+static inline bool report_unclosed_block(frontend_ctx *ctx, token *start_tok) {
+    if (ctx->shared->stream->error_occured) return true;
+    bool result = at_end(ctx->shared->stream);
     if (result) {
-        ERROR(p->stream, "%s", "unclosed block");
-        report(start_tok, DIAGNOSTIC_NOTE, false, p->stream, "block starts here");
+        ERROR(ctx->shared->stream, "%s", "unclosed block");
+        report(start_tok, DIAGNOSTIC_NOTE, false, ctx->shared->stream, "block starts here");
     }
     return result;
 }
-static bool parse_if(parser *p) {
-    token *if_tok = match_token(TOK_IF, p->stream);
+static bool parse_if(frontend_ctx *ctx) {
+    token *if_tok = match_token(TOK_IF, ctx->shared->stream);
     if (!if_tok) return false;
-    if (p->parse_mode != PARSE_ROUTINE) {
-        ERROR_AT(prev_token(p->stream), p->stream, "'if' can only be used under routine");
+    if (ctx->parse_mode != PARSE_ROUTINE) {
+        ERROR_AT(prev_token(ctx->shared->stream), ctx->shared->stream, "'if' can only be used under routine");
         return true;
     }
 
-    ir_instr *cmp_instr = instr_new(INSTR_CMP, p);
-    consume_value(&cmp_instr->bin.lhs, p);
+    ctx->parsing_relop = true;
+    ir_instr *cmp_instr = instr_new(INSTR_CMP, ctx);
+    consume_value(&cmp_instr->bin.lhs, ctx);
+    ctx->parsing_relop = false;
 
-    token *value_tok = prev_token(p->stream);
-    token *operator_tok = take_token(p->stream);
-
+    token *value_tok = prev_token(ctx->shared->stream);
+    token *operator_tok = take_token(ctx->shared->stream);
     cmp_instr->bin.tok = operator_tok;
-    vector_add(p->instrs, cmp_instr);
+    vector_add(&ctx->shared->instrs, cmp_instr);
 
     branch_type btype = BRANCH_NONE;
     bool is_signed = cmp_instr->bin.lhs.reg.sign == SIGN_SIGNED;
@@ -523,30 +526,41 @@ static bool parse_if(parser *p) {
     case TOK_GREATER_EQUAL: btype = is_signed ? BRANCH_GE_S : BRANCH_GE_U; break;
     case TOK_LESS:          btype = is_signed ? BRANCH_LT_S : BRANCH_LT_U; break;
     case TOK_LESS_EQUAL:    btype = is_signed ? BRANCH_LE_S : BRANCH_LE_U; break;
-    default: EXPECT_AT(value_tok, p->stream,
-                "expected relational operator ('<', '>', '<=', '>=', '==', '!=')");
+    default: 
+        EXPECT_AT(value_tok, ctx->shared->stream, "unrecognized relational operator after '%.*s'",
+                        value_tok->len, value_tok->start);
+        return true;
     }
 
-    consume_value(&cmp_instr->bin.rhs, p);
+    consume_value(&cmp_instr->bin.rhs, ctx);
     if (value_is_simple(&cmp_instr->bin.lhs, VAL_REG) &&
         value_is_simple(&cmp_instr->bin.rhs, VAL_REG) &&
         cmp_instr->bin.lhs.reg.sign != cmp_instr->bin.rhs.reg.sign)
-        ERROR_AT(operator_tok, p->stream, "comparison between different registers sign");
+        ERROR_AT(operator_tok, ctx->shared->stream, "comparison between different registers sign");
 
-    consume_token(TOK_LBRACE, "expected '{'", p->stream);
-    token *branch_tok = current_token(p->stream);
+    while (!match_token(TOK_LBRACE, ctx->shared->stream)) {
+        token *eof = match_token(TOK_EOF, ctx->shared->stream);
+        if (eof) {
+            ERROR_AT(eof, ctx->shared->stream, "expected '{' in if");
+            report(if_tok, DIAGNOSTIC_NOTE, false, ctx->shared->stream, "if starts here");
+            break;
+        }
+        parse_instr(ctx);
+    }
+    
+    token *branch_tok = current_token(ctx->shared->stream);
     bool is_jmp = branch_tok->type == TOK_JMP;
     if (is_jmp || branch_tok->type == TOK_CALL) {
-        advance_token(p->stream);
+        advance_token(ctx->shared->stream);
 
         // if operand == operand jmp/call operand
-        ir_instr *jmp_instr = instr_new(is_jmp ? INSTR_JMP : INSTR_CALL, p);
-        parse_value(&jmp_instr->branch.addr, p);
+        ir_instr *jmp_instr = instr_new(is_jmp ? INSTR_JMP : INSTR_CALL, ctx);
+        parse_value(&jmp_instr->branch.addr, ctx);
         jmp_instr->branch.type = btype;
         jmp_instr->branch.tok = branch_tok;
 
-        vector_add(p->instrs, jmp_instr);
-        consume_token(TOK_RBRACE, "expected '}' in if-jmp statement", p->stream);
+        vector_add(&ctx->shared->instrs, jmp_instr);
+        consume_token(TOK_RBRACE, "expected '}' in if-jmp statement", ctx->shared->stream);
         return true;
     }
 
@@ -556,113 +570,126 @@ static bool parse_if(parser *p) {
         [BRANCH_LT_U] = BRANCH_GE_U, [BRANCH_GE_S] = BRANCH_LT_S, [BRANCH_LE_S] = BRANCH_GT_S,
         [BRANCH_GT_S] = BRANCH_LE_S, [BRANCH_LT_S] = BRANCH_GE_S,
     };
-    ir_instr *else_label = indexed_label_new(p);
-    vector_add(p->instrs, label_jump_new(else_label->label, inverted_branches[btype], p));
+    ir_instr *else_label = indexed_label_new(ctx);
+    vector_add(&ctx->shared->instrs, label_jump_new(else_label->label, inverted_branches[btype], ctx));
     // Jcond else
     // A
     // jmp end
     // else:
     // B
     // end:
-    while (!match_token(TOK_RBRACE, p->stream) && !report_unclosed_block(p, if_tok)) {
-        parse_instr(p);
+    while (!match_token(TOK_RBRACE, ctx->shared->stream) && !report_unclosed_block(ctx, if_tok)) {
+        parse_instr(ctx);
     }
 
-    token *else_tok = match_token(TOK_ELSE, p->stream);
+    token *else_tok = match_token(TOK_ELSE, ctx->shared->stream);
     if (else_tok) {
-        consume_token(TOK_LBRACE, "expected '{'", p->stream);
+        consume_token(TOK_LBRACE, "expected '{'", ctx->shared->stream);
 
         // JMP end
-        ir_instr *end_label = indexed_label_new(p);
-        vector_add(p->instrs, label_jump_new(end_label->label, BRANCH_NONE, p));
+        ir_instr *end_label = indexed_label_new(ctx);
+        vector_add(&ctx->shared->instrs, label_jump_new(end_label->label, BRANCH_NONE, ctx));
 
         // Else label
-        vector_add(p->instrs, else_label);
+        vector_add(&ctx->shared->instrs, else_label);
 
-        while (!match_token(TOK_RBRACE, p->stream) && !report_unclosed_block(p, else_tok)) {
-            parse_instr(p);
+        while (!match_token(TOK_RBRACE, ctx->shared->stream) && !report_unclosed_block(ctx, else_tok)) {
+            parse_instr(ctx);
         }
 
         // End label
-        vector_add(p->instrs, end_label);
+        vector_add(&ctx->shared->instrs, end_label);
         return true;
     }
 
-    vector_add(p->instrs, else_label);
+    vector_add(&ctx->shared->instrs, else_label);
     return true;
 }
-static bool parse_labeldef(parser *p) {
-    bool is_interrupt = match_token(TOK_INT, p->stream) != NULL;
-    if (!is_interrupt && !match_token(TOK_COLON, p->stream)) return false;
+static bool parse_labeldef(frontend_ctx *ctx) {
+    bool is_interrupt = match_token(TOK_INT, ctx->shared->stream) != NULL;
+    if (!is_interrupt && !match_token(TOK_COLON, ctx->shared->stream)) return false;
 
-    token *lb_tok = consume_token(TOK_IDENT, "expected label name", p->stream);
+    token *lb_tok = consume_token(TOK_IDENT, "expected label name", ctx->shared->stream);
     if (!lb_tok) return true;
 
     // Check if label already exists
     char *lb_name = string_duplicate(lb_tok->start, lb_tok->len);
-    for (int i = 0; i < p->shared_labels->count; i++) {
-        label *defined_label = vector_get(p->shared_labels, i);
+    for (int i = 0; i < ctx->shared->labels->count; i++) {
+        label *defined_label = vector_get(ctx->shared->labels, i);
 
         // The current label is undefined label owner
-        if (defined_label->owner != NULL && defined_label->owner != p->current_label) continue;
+        if (defined_label->owner != NULL && defined_label->owner != ctx->current_label) continue;
 
         if (strcmp(lb_name, defined_label->name) == 0) {
-            ERROR_AT(lb_tok, p->stream,
+            ERROR_AT(lb_tok, ctx->shared->stream,
                 "label '%.*s' is already defined", lb_tok->len, lb_tok->start);
-            report(defined_label->tok, DIAGNOSTIC_NOTE, true,
-                    p->stream, "previous definition is here");
+            report(defined_label->tok, DIAGNOSTIC_NOTE, false,
+                    ctx->shared->stream, "previous definition is here");
             my_free(lb_name);
             return true;
         }
     }
 
     // Add instruction
-    ir_instr *instr = instr_new(INSTR_LABEL, p);
+    ir_instr *instr = instr_new(INSTR_LABEL, ctx);
     instr->label = my_malloc(sizeof *instr->label);
     *instr->label = (label) {
         .type = LABEL_NAMED, .name = lb_name,
         .tok = lb_tok, .is_word = false,
         .is_interrupt = is_interrupt, .instr = instr
     };
-    switch (p->parse_mode) {
-    case PARSE_NONE: p->parse_mode = PARSE_LABEL;
+    switch (ctx->parse_mode) {
+    case PARSE_NONE: ctx->parse_mode = PARSE_LABEL;
     case PARSE_LABEL:
-        p->current_label = instr->label;
+        ctx->current_label = instr->label;
         instr->label->owner = NULL;
         break;
-    case PARSE_ROUTINE: instr->label->owner = p->current_label; break;
+    case PARSE_ROUTINE: instr->label->owner = ctx->current_label; break;
     }
-    vector_add(p->shared_labels, instr->label);
-    vector_add(p->instrs, instr);
+    vector_add(ctx->shared->labels, instr->label);
+    vector_add(&ctx->shared->instrs, instr);
     return true;
 }
-static bool parse_return(parser *p) {
-    bool is_semicolon = match_token(TOK_SEMICOLON, p->stream);
-    if (!is_semicolon && !match_token(TOK_RETURN, p->stream)) return false;
-    if (p->parse_mode == PARSE_NONE) {
-        ERROR_AT(prev_token(p->stream), p->stream,
+static bool parse_return(frontend_ctx *ctx) {
+    bool is_semicolon = match_token(TOK_SEMICOLON, ctx->shared->stream);
+    if (!is_semicolon && !match_token(TOK_RETURN, ctx->shared->stream)) return false;
+    if (ctx->parse_mode == PARSE_NONE) {
+        ERROR_AT(prev_token(ctx->shared->stream), ctx->shared->stream,
             "return can only be used under a routine or a label");
         return true;
     }
 
-    ir_instr *instr = instr_new(p->current_label->is_interrupt ? INSTR_RETI : INSTR_RET, p);
-    vector_add(p->instrs, instr);
+    ir_instr *instr = instr_new(ctx->current_label->is_interrupt ? INSTR_RETI : INSTR_RET, ctx);
+    vector_add(&ctx->shared->instrs, instr);
 
     if (is_semicolon) {
-        reset_registers(p);
-        p->current_label = NULL;
-        p->parse_mode = PARSE_NONE;
+        reset_registers(ctx);
+        ctx->current_label = NULL;
+        ctx->parse_mode = PARSE_NONE;
     }
     return true;
 }
 
-static bool parse_binary(parser *p) {
-    value lhs = {0};
-    if (!parse_value(&lhs, p)) return false;
+static bool parse_unary(frontend_ctx *ctx) {
+    token *operator_tok = match_token(TOK_TILDE, ctx->shared->stream);
+    if (!operator_tok) return false;
+    value operand = {0};
+    if (!parse_value(&operand, ctx)) return false;
 
-    token *value_tok = prev_token(p->stream);
-    token *operator_tok = take_token(p->stream);
+    ir_instr *instr = instr_new(INSTR_NOT, ctx);
+    instr->unary.operand = operand;
+    instr->unary.tok = operator_tok;
+    vector_add(&ctx->shared->instrs, instr);
+    return true;
+}
+static bool parse_binary(frontend_ctx *ctx) {
+    value lhs = {0};
+    if (!parse_value(&lhs, ctx)) return false;
+
+    token *value_tok = prev_token(ctx->shared->stream);
+    token *operator_tok = take_token(ctx->shared->stream);
     ir_instr_kind kind = INSTR_LOAD;
+    bool is_assign = true;
     switch (operator_tok->type) {
     case TOK_EQUAL:         break;
     case TOK_PLUS_EQUAL:    kind = INSTR_ADD; break;
@@ -678,48 +705,49 @@ static bool parse_binary(parser *p) {
     case TOK_ROR_EQUAL:     kind = INSTR_ROR; break;
     case TOK_PERCENT_EQUAL: kind = INSTR_REM; break;
     default:
-        EXPECT_AT(value_tok, p->stream,
+        EXPECT_AT(value_tok, ctx->shared->stream,
             "unrecognized operator after '%.*s'", value_tok->len, value_tok->start);
-        value_free(&lhs);
-        return true;
+        goto error_before_rhs;
     }
-    if (p->parse_mode != PARSE_ROUTINE) {
-        ERROR_AT(operator_tok, p->stream, "binary operations can only be used under a routine");
-        value_free(&lhs);
-        return true;
+    if (ctx->parse_mode != PARSE_ROUTINE) {
+        ERROR_AT(operator_tok, ctx->shared->stream, "binary operations can only be used under a routine");
+        goto error_before_rhs;
     }
 
     value rhs = {0};
-    consume_value(&rhs, p);
+    consume_value(&rhs, ctx);
 
-    ir_instr *instr = instr_new(kind, p);
+    ir_instr *instr = instr_new(kind, ctx);
     instr->bin.lhs = lhs;
     instr->bin.rhs = rhs;
     instr->bin.tok = operator_tok;
 
-    vector_add(p->instrs, instr);
+    vector_add(&ctx->shared->instrs, instr);
+    return true;
+error_before_rhs:
+    value_free(&lhs);
     return true;
 }
 
-static bool parse_branch(parser *p) {
-    token *branch_tok = current_token(p->stream);
+static bool parse_branch(frontend_ctx *ctx) {
+    token *branch_tok = current_token(ctx->shared->stream);
     bool is_jmp = branch_tok->type == TOK_JMP;
     if (!is_jmp && branch_tok->type != TOK_CALL) return false;
 
-    advance_token(p->stream);
+    advance_token(ctx->shared->stream);
 
-    ir_instr *instr = instr_new(is_jmp ? INSTR_JMP : INSTR_CALL, p);
+    ir_instr *instr = instr_new(is_jmp ? INSTR_JMP : INSTR_CALL, ctx);
     instr->branch.type = BRANCH_NONE;
     instr->branch.tok = branch_tok;
-    vector_add(p->instrs, instr);
+    vector_add(&ctx->shared->instrs, instr);
 
-    return consume_value(&instr->branch.addr, p);
+    return consume_value(&instr->branch.addr, ctx);
 }
 
-static inline token *consume_label(char **name, parser *p) {
-    token *lb_tok = take_token(p->stream);
+static inline token *consume_label(char **name, frontend_ctx *ctx) {
+    token *lb_tok = take_token(ctx->shared->stream);
     if (lb_tok->type != TOK_IDENT) {
-        ERROR_AT(lb_tok,  p->stream, "'%.*s' is not a valid label name", lb_tok->len, lb_tok->start);
+        ERROR_AT(lb_tok,  ctx->shared->stream, "'%.*s' is not a valid label name", lb_tok->len, lb_tok->start);
         return NULL;
     }
     *name = string_duplicate(lb_tok->start, lb_tok->len);
@@ -735,150 +763,178 @@ void layout_free(layout *layout) {
     vector_free(&layout->fields);
     my_free(layout);
 }
-static bool parse_data_directive(parser *p) {
-    token *tok = current_token(p->stream);
-    if (tok->start[0] != 'd') return false;
+static bool parse_data_directive(frontend_ctx *ctx) {
+    token *tok = current_token(ctx->shared->stream);
+    if (tok->type != TOK_IDENT || tok->start[0] != 'd') return false;
 
     prim_size size = size_from_string(tok->start + 1, tok->len - 1);
     if (size == SIZE_NONE || size == -1) return false;
 
-    advance_token(p->stream);
+    advance_token(ctx->shared->stream);
 
-    ir_instr *instr = instr_new(INSTR_EMIT, p);
+    ir_instr *instr = instr_new(INSTR_EMIT, ctx);
     instr->emit.size = size;
     vector_init(&instr->emit.values);
 
     for (;;) {
         expr_node *expr = NULL;
-        consume_expression(&expr, p);
+        consume_expression(&expr, ctx);
         vector_add(&instr->emit.values, expr);
-        if (!match_token(TOK_COMMA, p->stream)) break;
+        if (!match_token(TOK_COMMA, ctx->shared->stream)) break;
     }
 
-    vector_add(p->instrs, instr);
+    vector_add(&ctx->shared->instrs, instr);
     return true;
 }
-
-static void parse_instr(parser *p) {
-    if (match_token(TOK_LIMIT, p->stream)) {
-        ir_instr *instr = instr_new(INSTR_LIMIT, p);
-        consume_expression(&instr->limit.start, p);
-        consume_expression(&instr->limit.end, p);
-        vector_add(p->instrs, instr);
-        return;
+static token *find_symbol(frontend_ctx *ctx, token *symbol) {
+    layout *layout = hashmap_get(&ctx->shared->layouts, symbol->start, symbol->len);
+    if (layout) return layout->tok;
+    bitset *bitset = hashmap_get(&ctx->shared->bitsets, symbol->start, symbol->len);
+    if (bitset) return bitset->tok;
+    for (int i = 0; i < ctx->shared->labels->count; i++) {
+        label *lb = vector_get(ctx->shared->labels, i);
+        if (token_is_str(symbol, lb->name)) return lb->tok;
     }
-    if (match_token(TOK_RESERVE, p->stream)) {
-        ir_instr *instr = instr_new(INSTR_RESERVE, p);
-        consume_expression(&instr->reserve.expr, p);
-        vector_add(p->instrs, instr);
-        return;
-    }
-    if (match_token(TOK_LAYOUT, p->stream)) {
-        token *layout_name = consume_token(TOK_IDENT, "expected layout name", p->stream);
-        if (!layout_name) return;
-        if (hashmap_get(p->layouts, layout_name->start, layout_name->len)) {
-            ERROR_AT(layout_name, p->stream,
-                "layout '%.*s' is already defined", layout_name->len, layout_name->start);
-            return;
-        }
+    return NULL;
+}
+static bool check_symbol(token *symbol, frontend_ctx *ctx) {
+    token *symtok = find_symbol(ctx, symbol);
+    if (!symtok) return false;
+    ERROR_AT(symbol, ctx->shared->stream, "'%.*s' is already defined", symbol->len, symbol->start);
+    report(symtok, DIAGNOSTIC_NOTE, false, ctx->shared->stream, "definition is here");
+    return true;
+}
+bool parse_declaration(frontend_ctx *ctx) {
+    token_stream *stream = ctx->shared->stream;
+    bool is_bitset = match_token(TOK_BITSET, stream);
+    if (!is_bitset && !match_token(TOK_LAYOUT, stream)) return false;
 
+    token *name = consume_token(TOK_IDENT, "expected identifier", stream);
+    if (!name || check_symbol(name, ctx))  return true;
+
+    bool is_aligned = !is_bitset && match_token(TOK_ALIGNED, stream);
+    if (!consume_token(TOK_LBRACE, "expected '{'", stream)) return true;
+
+    vector *fields;
+    if (is_bitset) {
+        bitset *bitset = my_malloc(sizeof *bitset);
+        fields = &bitset->bits;
+        hashmap_put(&ctx->shared->bitsets, name->start, name->len, bitset);
+    } else {
         layout *layout = my_malloc(sizeof *layout);
-        layout->aligned = match_token(TOK_ALIGN, p->stream);
-        vector_init(&layout->fields);
-        hashmap_put(p->layouts, layout_name->start, layout_name->len, layout);
+        layout->aligned = is_aligned;
+        fields = &layout->fields;
+        hashmap_put(&ctx->shared->layouts, name->start, name->len, layout);
+    }
+    vector_init(fields);
+    while (!stream->error_occured) {
+        token *item_name = consume_token(TOK_IDENT, "expected identifier", stream);
+        if (!item_name) break;
 
-        for (;;) {
-            token *field_name = current_token(p->stream);
-            if (field_name->type != TOK_IDENT) {
-                ERROR_AT(prev_token(p->stream), p->stream,
-                    "unexpected comma at end of a layout declaration");
+        bool duplicate = false;
+        for (size_t i = 0; i < fields->count; i++) {
+            void *item = vector_get(fields, i);
+            token *tok = is_bitset ? ((bitdef *)item)->name : ((layout_field *)item)->name;
+
+            if (tokens_equal(item_name, tok)) {
+                ERROR_AT(item_name, stream, "'%.*s' already exists in '%.*s'",
+                         item_name->len, item_name->start, name->len, name->start);
                 break;
             }
-            advance_token(p->stream);
-
+        }
+        if (is_bitset) {
+            bitdef *bit = my_malloc(sizeof *bit);
+            bit->name = item_name;
+            bit->index = NULL;
+            if (match_token(TOK_EQUAL, stream)) consume_expression(&bit->index, ctx);
+            vector_add(fields, bit);
+        } else {
             layout_field *field = my_malloc(sizeof *field);
-            field->name = field_name;
-            if (match_token(TOK_LSQUARE, p->stream)) {
-                consume_expression(&field->elements_count, p);
-                consume_token(TOK_RSQUARE, "expected ']'", p->stream);
+            field->name = item_name;
+            if (match_token(TOK_LSQUARE, stream)) {
+                consume_expression(&field->elements_count, ctx);
+                consume_token(TOK_RSQUARE, "expected ']'", stream);
             } else {
                 field->elements_count = expr_new(EXPR_NUMBER);
                 field->elements_count->number = 1;
             }
-
-            if (!resolve_expression(&field->element_size, p)) {
+            if (!resolve_expression(&field->element_size, ctx)) {
                 field->element_size = expr_new(EXPR_NUMBER);
                 field->element_size->number = 1;
             }
-
-            vector_add(&layout->fields, field);
-            if (!match_token(TOK_COMMA, p->stream)) break;
+            vector_add(fields, field);
         }
-        if (layout->fields.count == 0) {
-            ERROR_AT(layout_name, p->stream,
-                "layout '%.*s' has no fields", layout_name->len, layout_name->start);
-        }
+        if (match_token(TOK_RBRACE, stream)) break;
+        if (!consume_token(TOK_COMMA, "expected ',' or '}'", stream)) break;
+        if (match_token(TOK_RBRACE, stream)) break;
+    }
+    return true;
+}
+static void parse_instr(frontend_ctx *ctx) {
+    if (match_token(TOK_LIMIT, ctx->shared->stream)) {
+        ir_instr *instr = instr_new(INSTR_LIMIT, ctx);
+        consume_expression(&instr->limit.start, ctx);
+        consume_expression(&instr->limit.end, ctx);
+        vector_add(&ctx->shared->instrs, instr);
         return;
     }
-    if (match_token(TOK_DELETE, p->stream)) {
-        token *name = consume_token(TOK_IDENT, "expected layout name", p->stream);
+    if (match_token(TOK_RESERVE, ctx->shared->stream)) {
+        ir_instr *instr = instr_new(INSTR_RESERVE, ctx);
+        consume_expression(&instr->reserve.expr, ctx);
+        vector_add(&ctx->shared->instrs, instr);
+        return;
+    }
+    if (match_token(TOK_DELETE, ctx->shared->stream)) {
+        token *name = consume_token(TOK_IDENT, "expected layout name", ctx->shared->stream);
         if (!name) return;
 
-        layout *layout = hashmap_get(p->layouts, name->start, name->len);
+        layout *layout = hashmap_get(&ctx->shared->layouts, name->start, name->len);
         if (!layout) {
-            ERROR_AT(name, p->stream, "layout '%.*s' is undefined", name->len, name->start);
+            ERROR_AT(name, ctx->shared->stream, "layout '%.*s' is undefined", name->len, name->start);
             return;
         }
+        vector_add(&ctx->shared->deleted_layouts, layout);
+        hashmap_remove(&ctx->shared->layouts, name->start, name->len);
+        return;
+    }
+    if (match_token(TOK_NOP, ctx->shared->stream)) {
+        ir_instr *instr = instr_new(INSTR_NOP, ctx);
+        vector_add(&ctx->shared->instrs, instr);
+        return;
+    }
+    if (match_token(TOK_HLT, ctx->shared->stream)) {
+        ir_instr *instr = instr_new(INSTR_HALT, ctx);
+        vector_add(&ctx->shared->instrs, instr);
+        return;
+    }
+    if (parse_declaration(ctx) || parse_data_directive(ctx) || parse_labeldef(ctx) || parse_return(ctx) ||
+        parse_use(ctx) || parse_binary(ctx) || parse_if(ctx) || parse_branch(ctx) ||
+        parse_unary(ctx)) return;
 
-        vector_add(p->deleted_layouts, layout);
-        hashmap_remove(p->layouts, name->start, name->len);
-        return;
-    }
-    if (match_token(TOK_NOP, p->stream)) {
-        ir_instr *instr = instr_new(INSTR_NOP, p);
-        vector_add(p->instrs, instr);
-        return;
-    }
-    if (match_token(TOK_HLT, p->stream)) {
-        ir_instr *instr = instr_new(INSTR_HALT, p);
-        vector_add(p->instrs, instr);
-        return;
-    }
-    if (parse_data_directive(p) || parse_labeldef(p) || parse_return(p) ||
-        parse_use(p) || parse_binary(p) || parse_if(p) || parse_branch(p))
-        return;
-
-    unexpected_token(p);
+    unexpected_token(ctx);
 }
+bool irgen(frontend_shared *shared) {
+    if (shared->stream->tokens.count == 0) return true;
 
-void codegen(vector *instrs, arch_backend *backend, token_stream *stream);
-bool parse(arch_backend *backend, token_stream *stream, vector *shared_labels, hashmap *layouts, vector *deleted_layouts, vector *instrs) {
-    if (stream->tokens.count == 0) return true;
-
-    parser p = {
-        .backend = backend,
-        .register_states = my_malloc(p.backend->register_count * sizeof(register_state)),
+    frontend_ctx ctx = {
+        .register_states = my_malloc(shared->backend->register_count * sizeof(register_state)),
         .parse_mode = PARSE_NONE,
         .current_label = NULL,
-        .layouts = layouts,
-        .instrs = instrs,
-        .shared_labels = shared_labels,
-        .deleted_layouts = deleted_layouts,
-        .stream = stream,
+        .shared = shared,
     };
 
-    vector_init(&p.unresolved_labels);
-    reset_registers(&p);
+    vector_init(&ctx.unresolved_labels);
+    reset_registers(&ctx);
 
-    while (!p.stream->error_occured && !at_end(p.stream)) parse_instr(&p);
+    while (!ctx.shared->stream->error_occured && !at_end(ctx.shared->stream)) parse_instr(&ctx);
 
     // Resolve labels
-    for (int i = 0; i < p.unresolved_labels.count; i++) {
-        unresolved_label *unresolved_label = vector_get(&p.unresolved_labels, i);
+    for (int i = 0; i < ctx.unresolved_labels.count; i++) {
+        unresolved_label *unresolved_label = vector_get(&ctx.unresolved_labels, i);
 
         bool found = false;
-        for (int j = 0; j < p.shared_labels->count; j++) {
-            label *target_label = vector_get(p.shared_labels, j);
+        for (int j = 0; j < ctx.shared->labels->count; j++) {
+            label *target_label = vector_get(ctx.shared->labels, j);
 
             if (target_label->owner && unresolved_label->parent != target_label->owner) continue;
             if (token_is_str(unresolved_label->tok, target_label->name)) {
@@ -889,176 +945,81 @@ bool parse(arch_backend *backend, token_stream *stream, vector *shared_labels, h
         }
 
         if (!found)
-            ERROR_AT(unresolved_label->tok, p.stream,
+            ERROR_AT(unresolved_label->tok, ctx.shared->stream,
                     "label '%.*s' is undefined", unresolved_label->tok->len,
                     unresolved_label->tok->start);
         my_free(unresolved_label);
     }
-    vector_free(&p.unresolved_labels);
-    my_free(p.register_states);
-    return !p.stream->error_occured;
+    vector_free(&ctx.unresolved_labels);
+    my_free(ctx.register_states);
+    return !ctx.shared->stream->error_occured;
 }
-
-static int calculate_field_offset(codegen_ctx *c, layout *layout, layout_field *field) {
-    int offset = 0;
-    int padding_size = 0;
-    for (int i = 0; i < layout->fields.count; i++) {
-        layout_field *current_field = vector_get(&layout->fields, i);
-
-        int64_t element_size = eval_expr(c, current_field->element_size);
-        int64_t alignment_size = element_size; // The size for the alignment
-
-        int64_t total_size = element_size * eval_expr(c, current_field->elements_count);
-        if (layout->aligned) {
-            // Example:
-            // layout MY_LAYOUT aligned
-            //      A sizeof LAYOUT -> Align A from the layout type
-            if (current_field->element_size->kind == EXPR_LAYOUT &&
-                current_field->element_size->layout.is_sizeof &&
-                !current_field->element_size->layout.field &&
-                !current_field->element_size->layout.index)
-            {
-                layout_field *first_field = vector_get(&current_field->element_size->layout.value->fields, 0);
-                alignment_size = eval_expr(c, first_field->element_size);
-            }
-            if (alignment_size <= SIZE_DWORD && alignment_size % 2 == 0) {
-                uint64_t index = 64 - __builtin_clzll(alignment_size % SIZE_DWORD);
-                uint64_t alignment = c->backend->alignment[index];
-                offset = ((offset + alignment - 1) / alignment) * alignment;
-            }
+void frontend_shared_free(frontend_shared *shared) {
+    hashmap_iter bitset_iter = hashmap_iter_init(&shared->bitsets);
+    bitset *bitset;
+    while (hashmap_next(&bitset_iter, NULL, (void**)&bitset)) {
+        for (int i = 0; i < bitset->bits.count; i++) {
+            bitdef *def = vector_get(&bitset->bits, i);
+            expr_free(def->index);
+            my_free(def);
         }
-        if (tokens_equal(current_field->name, field->name)) break;
-        if (token_is_str(current_field->name, "padding")) padding_size = total_size;
-        offset += total_size;
+        vector_free(&bitset->bits);
+        my_free(bitset);
     }
-    offset -= padding_size;
-    return offset;
+    hashmap_free(&shared->bitsets);
+
+    hashmap_iter layout_iter = hashmap_iter_init(&shared->layouts);
+    layout *layout;
+    while (hashmap_next(&layout_iter, NULL, (void**)&layout)) {
+        layout_free(layout);
+    }
+    hashmap_free(&shared->layouts);
+    for (int i = 0; i < shared->deleted_layouts.count; i++) {
+        layout = vector_get(&shared->deleted_layouts, i);
+        layout_free(layout);
+    }
+    vector_free(&shared->deleted_layouts);
+
+    for (int i = 0; i < shared->instrs.count; i++) {
+        ir_instr *instr = vector_get(&shared->instrs, i);
+        switch (instr->kind) {
+        case INSTR_LIMIT:
+            expr_free(instr->limit.start);
+            expr_free(instr->limit.end);
+            break;
+        case INSTR_RESERVE:
+            expr_free(instr->reserve.expr);
+            break;
+        case INSTR_LABEL:
+            if (instr->label->type == LABEL_NAMED) continue;
+            my_free(instr->label);
+            break;
+        case INSTR_EMIT:
+            for (int i = 0; i < instr->emit.values.count; i++) {
+                expr_node *value = vector_get(&instr->emit.values, i);
+                expr_free(value);
+            }
+            vector_free(&instr->emit.values);
+            break;
+        case INSTR_NOT:
+            value_free(&instr->unary.operand);
+            break;
+        case INSTR_CALL: case INSTR_INT: case INSTR_JMP:
+            value_free(&instr->branch.addr);
+            break;
+        case INSTR_LOAD: case INSTR_SUB: case INSTR_AND: case INSTR_ADD: case INSTR_MUL:
+        case INSTR_DIV:  case INSTR_REM: case INSTR_OR:  case INSTR_XOR: case INSTR_SHL:
+        case INSTR_SHR:  case INSTR_ROL: case INSTR_ROR: case INSTR_CMP:
+            value_free(&instr->bin.lhs);
+            value_free(&instr->bin.rhs);
+            break;
+        case INSTR_NOP:  case INSTR_HALT:  case INSTR_RET:
+        case INSTR_RETI: case INSTR_COUNT: break;
+        }
+        my_free(instr);
+    }
+    vector_free(&shared->instrs);
 }
-
-int64_t eval_expr(codegen_ctx *c, expr_node *expr) {
-    if (!expr) return 0;
-    switch (expr->kind) {
-    case EXPR_NUMBER: expr->result = expr->number; break;
-    case EXPR_LABEL:  expr->result = expr->label->instr->addr; break;
-    case EXPR_LAYOUT: {
-        layout *layout = expr->layout.value;
-        layout_field *field = expr->layout.field;
-        expr->result = 0;
-        if (field) {
-            int64_t count = eval_expr(c, field->elements_count);
-            int64_t size = eval_expr(c, field->element_size);
-            if (expr->layout.is_sizeof) {
-                expr->result = size * count;
-                break;
-            }
-
-            if (expr->layout.index) {
-                if (count == 1) {
-                    ERROR_AT(expr->tok, c->stream,
-                        "layout field of '%.*s' does not support indexing (it only has one element)",
-                            expr->tok->len, expr->tok->start);
-                    return false;
-                }
-
-                int64_t index = eval_expr(c, expr->layout.index);
-                if (index >= count) {
-                    ERROR_AT(expr->tok, c->stream, "array index out of bounds");
-                    return false;
-                }
-                expr->result += size * index;
-            }
-            expr->result += calculate_field_offset(c, layout, field);
-            break;
-        }
-
-        if (expr->layout.is_sizeof) {
-            field = vector_get(&layout->fields, layout->fields.count - 1);
-
-            int64_t size = eval_expr(c, field->element_size);
-            int64_t count = eval_expr(c, field->elements_count);
-            expr->result = calculate_field_offset(c, layout, field) + size * count;
-            break;
-        }
-
-        for (int i = 0; i < layout->fields.count; i++) {
-            field = vector_get(&layout->fields, i);
-            if (token_is_str(field->name, "padding")) {
-                expr->result += eval_expr(c, field->element_size) *
-                                eval_expr(c, field->elements_count);
-                break;
-            }
-        }
-        break;
-    }
-    case EXPR_UNARY: {
-        int64_t val = eval_expr(c, expr->unary.expr);
-        switch (expr->unary.op) {
-        case OPERATOR_UNARY_MINUS: val = -val; break;
-        case OPERATOR_BIT_NOT:     val = ~val; break;
-        case OPERATOR_LOGIC_NOT:   val = !val; break;
-        case OPERATOR_SIN:         val = (int64_t)sin((double)val); break;
-        case OPERATOR_COS:         val = (int64_t)cos((double)val); break;
-        case OPERATOR_TAN:         val = (int64_t)tan((double)val); break;
-        case OPERATOR_EXP:         val = (int64_t)exp((double)val); break;
-        case OPERATOR_LOG:         val = (int64_t)log((double)val); break;
-        case OPERATOR_ABS:         val = labs(val); break;
-        case OPERATOR_SQRT:        val = (int64_t)sqrt((double)val); break;
-        case OPERATOR_SIGN:        val = (val > 0) - (val < 0); break;
-        case OPERATOR_CEIL:        val = (int64_t)ceil((double)val); break;
-        case OPERATOR_FLOOR:       val = (int64_t)floor((double)val); break;
-        default: break;
-        }
-        expr->result = val;
-        break;
-    }
-    case EXPR_BINARY: {
-        int64_t lhs = eval_expr(c, expr->binary.lhs);
-        int64_t rhs = eval_expr(c, expr->binary.rhs);
-        switch (expr->binary.op) {
-        case OPERATOR_ADD: lhs += rhs;  break;
-        case OPERATOR_SUB: lhs -= rhs;  break;
-        case OPERATOR_MUL: lhs *= rhs;  break;
-        case OPERATOR_DIV:
-            if (rhs == 0) {
-                ERROR_AT(expr->binary.op_tok, c->stream, "division by zero");
-                break;
-            }
-            lhs /= rhs;
-            break;
-        case OPERATOR_MOD:
-            if (rhs == 0) {
-                ERROR_AT(expr->binary.op_tok, c->stream, "modulo by zero");
-                return false;
-            }
-            lhs %= rhs;
-            break;
-        case OPERATOR_BIT_AND: lhs &= rhs; break;
-        case OPERATOR_BIT_OR:  lhs |= rhs; break;
-        case OPERATOR_BIT_XOR: lhs ^= rhs; break;
-        case OPERATOR_LSHIFT:  lhs <<= rhs; break;
-        case OPERATOR_RSHIFT:  lhs >>= rhs; break;
-        case OPERATOR_POW: lhs = (int64_t)pow((double)lhs, (double)rhs); break;
-        case OPERATOR_MIN: lhs = (lhs < rhs) ? lhs : rhs; break;
-        case OPERATOR_MAX: lhs = (lhs > rhs) ? lhs : rhs; break;
-        case OPERATOR_LT:  lhs = (lhs < rhs); break;
-        case OPERATOR_LE:  lhs = (lhs <= rhs); break;
-        case OPERATOR_EQ:  lhs = (lhs == rhs); break;
-        case OPERATOR_NEQ: lhs = (lhs != rhs); break;
-        case OPERATOR_GE:  lhs = (lhs >= rhs); break;
-        case OPERATOR_GT:  lhs = (lhs > rhs); break;
-        case OPERATOR_LOGIC_AND: lhs = (lhs && rhs); break;
-        case OPERATOR_LOGIC_OR:  lhs = (lhs || rhs); break;
-        default: break;
-        }
-
-        expr->result = lhs;
-        break;
-    }
-    }
-
-    return expr->result;
-}
-
 void value_free(value *val) {
     if (val->kind == VAL_EXPR) expr_free(val->expr);
 
@@ -1070,7 +1031,7 @@ void value_free(value *val) {
 void expr_free(expr_node *expr) {
     if (!expr) return;
     switch (expr->kind) {
-    case EXPR_NUMBER: case EXPR_LABEL: break;
+    case EXPR_NUMBER: case EXPR_LABEL: case EXPR_BITSET: break;
     case EXPR_LAYOUT:
         expr_free(expr->layout.index);
         break;
@@ -1083,95 +1044,4 @@ void expr_free(expr_node *expr) {
         break;
     }
     my_free(expr);
-}
-
-bool value_matches(const value *actual, const value *expected) {
-    if (!actual && !expected) return true;
-    if (!actual || !expected || actual->kind != expected->kind || actual->is_addr != expected->is_addr ||
-        actual->op_type != expected->op_type || !value_matches(actual->operand, expected->operand))
-        return false;
-
-    switch (actual->kind) {
-    case VAL_REG:
-        return actual->reg.index == expected->reg.index &&
-            (actual->size == SIZE_NONE || expected->size == SIZE_NONE ||
-            actual->size == expected->size) &&
-            (actual->reg.sign == SIGN_NONE || expected->reg.sign == SIGN_NONE ||
-            actual->reg.sign == expected->reg.sign);
-    case VAL_EXPR: return actual->size <= expected->size;
-    case VAL_FLAGS:
-    case VAL_SP:
-    case VAL_NONE: return true;
-    }
-}
-
-// Prints a value without '\n', 'show imm' shows the immediate value if the value kind is an expression.
-void print_value(FILE *out, const value *val, bool show_imm) {
-    if (!val) return;
-    if (val->is_addr) fprintf(out, "[");
-    switch (val->kind) {
-    case VAL_REG: {
-        bool size_none = val->size == SIZE_NONE || val->size == SIZE_WORD;
-        if (val->reg.sign == SIGN_NONE && size_none) {
-            fprintf(out, "r%d", val->reg.index);
-            break;
-        }
-
-        const char *sign = val->reg.sign == SIGN_SIGNED ? "s" :
-                    val->reg.sign == SIGN_UNSIGNED ? "u" : "";
-        if (size_none) {
-            fprintf(out, "r%d(%s)", val->reg.index, sign);
-            break;
-        }
-
-        fprintf(out, "r%d(%s%d)", val->reg.index, sign, val->size * 8);
-        break;
-    }
-    case VAL_EXPR: {
-        uint8_t size = val->size * 8;
-        if (show_imm) {
-            fprintf(out, "%lld(imm%d)", val->expr->result, size);
-            break;
-        }
-        fprintf(out, "imm%d", size);
-        break;
-    }
-    case VAL_FLAGS: fprintf(out, "flags"); break;
-    case VAL_SP:    fprintf(out, "sp");    break;
-    case VAL_NONE:  break;
-    }
-    if (val->operand) {
-        const char op_char[] = {
-            [OPERATOR_ADD] = '+', [OPERATOR_SUB] = '-', [OPERATOR_MUL] = '*', [OPERATOR_DIV] = '/'
-        };
-        fprintf(out, " %c ", op_char[val->op_type]);
-        print_value(out, val->operand, show_imm);
-    }
-    if (val->is_addr) fprintf(out, "]");
-}
-
-void print_values(FILE *out, const value *val1, const value *val2, bool show_imm) {
-    print_value(out, val1, show_imm);
-    if (val2->kind != VAL_NONE) {
-        fprintf(out, ", ");
-        print_value(out, val2, show_imm);
-    }
-    fputc('\n', out);
-}
-
-void emit_value(codegen_ctx *c, const value *val, prim_size size) {
-    if (!val) return;
-    if (val->kind == VAL_EXPR) c->backend->emit(c, val->expr->result, size);
-    if (val->operand) emit_value(c, val->operand, val->operand->size);
-}
-void eval_value(codegen_ctx *c, value *val) {
-    if (!val) return;
-    if (val->kind == VAL_EXPR) {
-        eval_expr(c, val->expr);
-        val->size = get_primitive_size(val->expr->result);
-    }
-    while (val->operand) {
-        val = val->operand;
-        eval_value(c, val);
-    }
 }

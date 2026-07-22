@@ -7,35 +7,36 @@ Below is a list of the main tasks and improvements that still need to be complet
 ## TODO
 * [ ] Implement an audio, keyboard and joystick controller
 * [ ] Test the floppy disk controller
-* [ ] Optimize the VS (the VMS language) compiler
-* [ ] Create a rom with a VS compiler and an UI for the console
-* [ ] Fix known bugs (a lots of bugs, maybe around ~500)
+* [x] Optimize the BSL (the SPRK32 language) compiler
+* [ ] Create a rom with a BSL compiler and an UI for the console
+* [ ] Upgrade the video processing unit (for now has only 255 variants of grey)
+* [ ] Fix known bugs (a lots of bugs)
 * [ ] Complete software/hardware documentation
 * [ ] Make the emulator cross-platform (for now the code is running under Macos)
 
-# Video Machine System
+# SPRK32
 
-VMS (Virtual Machine System) is a fantasy computer environment inspired by 80/90s home computers, built for pure low-level fun and experimentation.
+SPRK32 is a fantasy computer environment inspired by 80/90s home computers, built for pure low-level fun and experimentation.
 The system is designed around the idea of writing software close to the hardware, where every resource matters.
 
-The virtual machine reflects the spirit of early personal computers:
+SPRK32 reflects the spirit of early personal computers:
 * CPU clock: **16MHz**
 * Display resolution: **160×120**
 * Color depth: **256 colors**
-* Storage: **3.5" HD floppy disk images**
+* Storage: **3.5" HD floppy disk**
 
 These limitations are part of the design and encourage efficient and creative programming.
 
 The project provides a complete development environment including:
 
-* An emulator
+* An emulator (for now with a CPU, ICU, DMA, FDC and a VPU)
 * A custom high-level assembler-like language (BSL) compiler
 * A disassembler
 
 All tools are accessible through a built-in command interpreter.
-Commands can be executed either interactively via terminal or through a configuration file (`vms.cfg`).
+Commands can be executed either interactively via terminal or through a configuration file (`sprk32.cfg`).
 
-Example of a vms.cfg:
+Example of a sprk32.cfg:
 ```
 compile rom.bsl to rom.bin as 65536
 disasm rom.bin rom.s
@@ -51,7 +52,7 @@ emulate
 
 # Base system language
 
-Software for the VMS is written in a custom assembly language designed specifically for the architecture called BSL. While it maps almost one-to-one to the underlying instruction set, the assembler provides a set of compile-time features that significantly improve readability without introducing any runtime overhead.
+Software for the SPRK32 is written in a custom assembly language designed specifically for the architecture called BSL. While it maps almost one-to-one to the underlying instruction set, the assembler provides a set of compile-time features that significantly improve readability without introducing any runtime overhead.
 
 Rather than treating assembly as a stream of anonymous instructions, the language encourages explicit declaration of resources. Procedures declare the registers they use, memory layouts are described symbolically, and hardware registers are accessed through named structures instead of hardcoded addresses.
 
@@ -73,23 +74,28 @@ Rather than treating assembly as a stream of anonymous instructions, the languag
 Memory maps can be declared directly in source code, allowing both RAM and memory-mapped peripherals to be addressed symbolically.
 
 ```
-layout mmap align
+layout mmap align {
     rom   [rom_size],
     ivt   sizeof ivt,
     sys   sizeof sys,
     ...
+}
 ```
 
 The same mechanism can also be used to describe application-specific data structures at compile time.
 
 ```
-layout game align
+layout game align {
     padding mmap@wram,
     x 2,
     y 2
+}
+
+bitset flag { zero, sign, overflow, carry, interrupt }
 
 r0 = [r3 + game@x]
 r1 = [r3 + game@y]
+...
 ```
 
 The assembler also includes a lightweight compile-time metaprogramming system. Macros may accept variadic arguments, iterate over them, and generate code during assembly, allowing common idioms to remain concise while expanding into ordinary instructions.
@@ -125,4 +131,4 @@ Overall, the language aims to preserve the simplicity and predictability of clas
 
 # LICENSE
 
-VMS is licensed under the MIT License. See the [`LICENSE`](LICENSE) file for more details.
+SPRK32 is licensed under the MIT License. See the [`LICENSE`](LICENSE) file for more details.

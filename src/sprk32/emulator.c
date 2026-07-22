@@ -842,20 +842,19 @@ static inline void set_zs(emu_cpu *cpu, uint32_t result) {
 static inline void set_add_overflow(emu_cpu *cpu, uint32_t a, uint32_t b, uint32_t r) {
     set_flag(cpu, FLAG_OVERFLOW, SIGN_BIT_32(~(a ^ b) & (a ^ r)));
 }
-
 static inline void set_sub_overflow(emu_cpu *cpu, uint32_t a, uint32_t b, uint32_t r) {
     set_flag(cpu, FLAG_OVERFLOW, SIGN_BIT_32((a ^ b) & (a ^ r)));
 }
-
 static void op_add(emu_cpu *cpu, uint32_t value) {
-    uint64_t result = cpu->registers[REG_A] + value;
+    uint64_t result = (uint64_t)cpu->registers[REG_A] + value;
+    uint32_t result32 = (uint32_t)result;
     cpu->cycles++;
 
     set_flag(cpu, FLAG_CARRY, result > UINT32_MAX);
-    set_add_overflow(cpu, cpu->registers[REG_A], value, (uint32_t)result);
-    set_zs(cpu, (uint32_t)result);
+    set_add_overflow(cpu, cpu->registers[REG_A], value, result32);
+    set_zs(cpu, result32);
 
-    cpu->registers[REG_A] = (uint32_t)result;
+    cpu->registers[REG_A] = result32;
 }
 static void op_adc(emu_cpu *cpu, uint32_t value) {
     uint64_t result = (uint64_t)cpu->registers[REG_A] + (uint64_t)value + (uint64_t)get_flag(cpu, FLAG_CARRY);
@@ -864,10 +863,8 @@ static void op_adc(emu_cpu *cpu, uint32_t value) {
     set_flag(cpu, FLAG_CARRY, result > UINT32_MAX);
     set_add_overflow(cpu, cpu->registers[REG_A], value, (uint32_t)result);
     set_zs(cpu, (uint32_t)result);
-
     cpu->registers[REG_A] = (uint32_t)result;
 }
-
 static void op_sub(emu_cpu *cpu, uint32_t value) {
     uint32_t result = cpu->registers[REG_A] - value;
     cpu->cycles++;
@@ -878,7 +875,6 @@ static void op_sub(emu_cpu *cpu, uint32_t value) {
 
     cpu->registers[REG_A] = (uint32_t)result;
 }
-
 static void op_sbc(emu_cpu *cpu, uint32_t value) {
     uint32_t inv_carry = get_flag(cpu, FLAG_CARRY) ? 0 : 1;
     uint64_t result = (uint64_t)cpu->registers[REG_A] - value - inv_carry;
@@ -890,7 +886,6 @@ static void op_sbc(emu_cpu *cpu, uint32_t value) {
 
     cpu->registers[REG_A] = (uint32_t)result;
 }
-
 static void op_mul(emu_cpu *cpu, uint32_t value) {
     uint64_t result = (uint64_t)cpu->registers[REG_A] * (uint64_t)value;
 
@@ -903,7 +898,6 @@ static void op_mul(emu_cpu *cpu, uint32_t value) {
     set_flag(cpu, FLAG_OVERFLOW, overflowed);
     set_zs(cpu, (uint32_t)result);
 }
-
 static void op_imul(emu_cpu *cpu, uint32_t value) {
     int32_t a = (int32_t)cpu->registers[REG_A];
     int32_t b = (int32_t)value;
@@ -918,7 +912,6 @@ static void op_imul(emu_cpu *cpu, uint32_t value) {
     set_flag(cpu, FLAG_OVERFLOW, overflowed);
     set_zs(cpu, cpu->registers[REG_A]);
 }
-
 static inline void op_shl(emu_cpu *cpu, uint8_t value) {
     value &= 31;
     if (value == 0) return;
@@ -1193,7 +1186,7 @@ void cpu_step(emu_cpu *cpu) {
             }
             break;
         case 2: {
-            uint32_t value = (int32_t)fetch8(cpu);
+            uint32_t value = (int32_t)(int8_t)fetch8(cpu);
             switch (arg2) {
             case 0: op_add(cpu, value); break;
             case 1: op_adc(cpu, value); break;
@@ -1256,8 +1249,8 @@ void cpu_step(emu_cpu *cpu) {
     case BLOCK_LOAD_IMM: { // MOV Rn, imm
         uint32_t value = 0;
         switch (arg2) {
-        case 0: value = (int32_t)fetch8(cpu);  break;
-        case 1: value = (int32_t)fetch16(cpu); break;
+        case 0: value = (int32_t)(int8_t)fetch8(cpu);  break;
+        case 1: value = (int32_t)(int16_t)fetch16(cpu); break;
         case 2: value = fetch32(cpu); break;
         case 3: enter_exception(cpu, IVT_EXC_ILLEGAL_INSTRUCTION); break;
         }
@@ -1268,8 +1261,8 @@ void cpu_step(emu_cpu *cpu) {
         uint32_t addr = cpu->registers[REG_I] + fetch8(cpu);
         uint32_t value = 0;
         switch (arg2) {
-        case 0: value = (int32_t)cpu_read8(cpu, addr);  break;
-        case 1: value = (int32_t)cpu_read16(cpu, addr); break;
+        case 0: value = (int32_t)(int8_t)cpu_read8(cpu, addr);  break;
+        case 1: value = (int32_t)(int16_t)cpu_read16(cpu, addr); break;
         case 2: value = cpu_read32(cpu, addr); break;
         case 3: enter_exception(cpu, IVT_EXC_ILLEGAL_INSTRUCTION); break;
         }
@@ -1290,8 +1283,8 @@ void cpu_step(emu_cpu *cpu) {
         uint32_t addr = cpu->registers[REG_I];
         uint32_t value = 0;
         switch (arg2) {
-        case 0: value = (int32_t)cpu_read8(cpu, addr);  break;
-        case 1: value = (int32_t)cpu_read16(cpu, addr); break;
+        case 0: value = (int32_t)(int8_t)cpu_read8(cpu, addr);  break;
+        case 1: value = (int32_t)(int16_t)cpu_read16(cpu, addr); break;
         case 2: value = cpu_read32(cpu, addr); break;
         case 3: enter_exception(cpu, IVT_EXC_ILLEGAL_INSTRUCTION); break;
         }
@@ -1331,7 +1324,7 @@ void cpu_step(emu_cpu *cpu) {
     case BLOCK_LOGIC:
         switch (arg1) {
         case 0: op_and(cpu, cpu->registers[arg2]); break;
-        case 1: op_or(cpu, cpu->registers[arg2]);  break;
+        case 1: op_or(cpu,  cpu->registers[arg2]); break;
         case 2: op_xor(cpu, cpu->registers[arg2]); break;
         case 3: {
             uint32_t value = fetch8(cpu);
@@ -1422,8 +1415,8 @@ void cpu_step(emu_cpu *cpu) {
         case 2: { // CMP A, imm
             uint32_t value = 0;
             switch (arg2) {
-            case 0: value = (int32_t)fetch8(cpu);  break;
-            case 1: value = (int32_t)fetch16(cpu); break;
+            case 0: value = (int32_t)(int8_t)fetch8(cpu);  break;
+            case 1: value = (int32_t)(int16_t)fetch16(cpu); break;
             case 2: value = fetch32(cpu); break;
             case 3: enter_exception(cpu, IVT_EXC_ILLEGAL_INSTRUCTION); break;
             }
@@ -1433,8 +1426,8 @@ void cpu_step(emu_cpu *cpu) {
         case 3: { // CMP I, imm
             uint32_t value = 0;
             switch (arg2) {
-            case 0: value = (int32_t)fetch8(cpu);  break;
-            case 1: value = (int32_t)fetch16(cpu); break;
+            case 0: value = (int32_t)(int8_t)fetch8(cpu);  break;
+            case 1: value = (int32_t)(int16_t)fetch16(cpu); break;
             case 2: value = fetch32(cpu); break;
             case 3: enter_exception(cpu, IVT_EXC_ILLEGAL_INSTRUCTION); break;
             }
@@ -1449,7 +1442,7 @@ void cpu_step(emu_cpu *cpu) {
     printf("[DEBUG][CPU] ip=%u sp=%u | %-10s %d %d | ",
             cpu->ip, cpu->sp, opcode_block_str[block], arg1, arg2);
     for (int i = 0; i < REG_COUNT; i++) {
-        printf("r%d=%d ", i, cpu->registers[i]);
+        printf("r%u=%u ", i, cpu->registers[i]);
     }
     putchar('\n');
 }

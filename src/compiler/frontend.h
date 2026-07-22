@@ -10,7 +10,6 @@ typedef enum {
     INSTR_LIMIT,
     INSTR_EMIT,
     INSTR_RESERVE,
-
     INSTR_NOP,
     INSTR_HALT,
     INSTR_LABEL,
@@ -21,6 +20,8 @@ typedef enum {
     INSTR_RETI,
 
     INSTR_LOAD,
+    INSTR_NOT,
+    
     INSTR_ADD,
     INSTR_SUB,
     INSTR_MUL,
@@ -29,18 +30,16 @@ typedef enum {
     INSTR_AND,
     INSTR_OR,
     INSTR_XOR,
-
     INSTR_SHL,
     INSTR_SHR,
     INSTR_ROL,
     INSTR_ROR,
-
     INSTR_CMP,
+    
     INSTR_COUNT,
 } ir_instr_kind;
-
 typedef struct label label;
-typedef struct instr ir_instr;
+typedef struct ir_instr ir_instr;
 struct label {
     enum {
         LABEL_NAMED,
@@ -50,7 +49,6 @@ struct label {
         char *name;
         int index;
     };
-
     bool is_interrupt;
     bool is_word;
     label *owner;
@@ -68,8 +66,8 @@ typedef enum {
     EXPR_UNARY,
     EXPR_BINARY,
     EXPR_LAYOUT,
+    EXPR_BITSET,
 } expr_kind;
-
 typedef enum {
     OPERATOR_NONE,
     OPERATOR_ADD,
@@ -107,7 +105,6 @@ typedef enum {
     OPERATOR_CEIL,
     OPERATOR_FLOOR,
 } operator_type;
-
 typedef enum {
     VAL_NONE,
     VAL_REG,
@@ -136,10 +133,18 @@ typedef struct {
     expr_node *element_size;
 } layout_field;
 typedef struct {
-    vector fields; // Vector of layout_field_t
+    vector fields; // Vector of layout_field
     bool aligned;
+    token *tok;
 } layout;
-
+typedef struct {
+    token *name;
+    expr_node *index;
+} bitdef;
+typedef struct {
+    vector bits;
+    token *tok;
+} bitset;
 struct expr_node {
     expr_kind kind;
     token *tok;
@@ -164,10 +169,13 @@ struct expr_node {
             struct expr_node *index;
             bool is_sizeof;
         } layout;
+        struct {
+            bitset *set;
+            bitdef *bit;
+        } bitset;
     };
     int64_t result;
 };
-
 typedef enum {
     BRANCH_NONE,
     BRANCH_EQ,
@@ -181,19 +189,21 @@ typedef enum {
     BRANCH_LE_U,
     BRANCH_LE_S,
 } branch_type;
-
-typedef struct {
-    value lhs;
-    value rhs;
-    token *tok; // Operator tok
-} binary_instr;
-struct instr {
+struct ir_instr {
     ir_instr_kind kind;
     uint64_t addr;
     uint32_t current_size;
     union {
         label *label;
-        binary_instr bin;
+        struct {
+            value lhs;
+            value rhs;
+            token *tok; // Operator token
+        } bin;
+        struct {
+            value operand;
+            token *tok;
+        } unary;
         struct {
             branch_type type;
             value addr;
@@ -216,21 +226,18 @@ struct instr {
         } set_flag;
     };
 };
-
 typedef struct {
     token *tok;
     label *parent;
     label **dest;
 } unresolved_label;
-
-void value_free(value *value);
-void layout_free(layout *layout);
-void expr_free(expr_node *expr);
-
-bool parse(arch_backend *backend, token_stream *stream, vector *shared_labels,
-            hashmap *layouts, vector *deleted_layouts, vector *instrs);
-void eval_value(codegen_ctx *c, value *value);
-int64_t eval_expr(codegen_ctx *c, expr_node *expr);
+typedef struct {
+    vector deleted_layouts, instrs;
+    hashmap layouts, bitsets;
+    arch_backend *backend;
+    token_stream *stream;
+    vector *labels;
+} frontend_shared;
 
 static inline bool value_is_simple(value *value, value_kind kind) {
     return value->kind == kind && !value->is_addr && value->op_type == OPERATOR_NONE;
@@ -246,9 +253,11 @@ static inline bool value_is_interrupt(value *value) {
             value->expr->kind == EXPR_LABEL && value->expr->label &&
             value->expr->label->is_interrupt;
 }
+bool irgen(frontend_shared *shared);
 
-bool value_matches(const value *actual, const value *expected);
-void print_value(FILE *out, const value *value, bool show_imm);
-void print_values(FILE *out, const value *value1, const value *value2, bool show_imm);
+void frontend_shared_free(frontend_shared *shared);
+void value_free(value *value);
+void layout_free(layout *layout);
+void expr_free(expr_node *expr);
 
 #endif
