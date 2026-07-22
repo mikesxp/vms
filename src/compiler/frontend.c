@@ -80,18 +80,12 @@ static inline void unexpected_token(frontend_ctx *ctx) {
 }
 
 bool token_is_register(uint8_t *index, token *tok, frontend_ctx *ctx) {
-    return false;
-}
-bool read_register(uint8_t *index, frontend_ctx *ctx) {
-    token *tok = current_token(ctx->shared->stream);
     if (tok->type != TOK_IDENT) return false;
     for (uint8_t i = 0; i < ctx->shared->backend->register_count; i++) {
-        register_state *reg = &ctx->register_states[i];
         char reg_name[5];
         snprintf(reg_name, ARRAYLEN(reg_name), "r%u", i);
 
         if (token_is_str(tok, reg_name)) {
-            advance_token(ctx->shared->stream);
             if (index) *index = i;
             return true;
         }
@@ -157,11 +151,12 @@ static bool parse_use(frontend_ctx *ctx) {
 
     for (;;) {
         uint8_t reg = 0;
-        if (!read_register(&reg, ctx)) {
-            token *tok = current_token(ctx->shared->stream);
+        token *tok = current_token(ctx->shared->stream);
+        if (!token_is_register(&reg, tok, ctx)) {
             ERROR_AT(tok, ctx->shared->stream, "'%.*s' is not a register", tok->len, tok->start);
             return true;
         }
+        advance_token(ctx->shared->stream);
         ctx->register_states[reg].used = !is_unuse;
         if (!is_unuse) parse_type(&ctx->register_states[reg].type, ctx);
         if (!match_token(TOK_COMMA, ctx->shared->stream)) break;
@@ -424,19 +419,21 @@ static inline bool consume_expression(expr_node **out, frontend_ctx *ctx) {
 
 static inline bool consume_value(value *val, frontend_ctx *ctx);
 static bool parse_raw_value(value *val, frontend_ctx *ctx) {
+    token_stream *stream = ctx->shared->stream;
     val->op_type = OPERATOR_NONE;
     val->operand = NULL;
-    if (match_token(TOK_FLAGS, ctx->shared->stream)) {
+    if (match_token(TOK_FLAGS, stream)) {
         val->kind = VAL_FLAGS;
         return true;
     }
-    if (match_token(TOK_SP, ctx->shared->stream)) {
+    if (match_token(TOK_SP, stream)) {
         val->kind = VAL_SP;
         return true;
     }
-    if (read_register(&val->reg.index, ctx)) {
+    if (token_is_register(&val->reg.index, current_token(stream), ctx)) {
+        advance_token(stream);
         if (!ctx->register_states[val->reg.index].used) {
-            ERROR_AT(prev_token(ctx->shared->stream), ctx->shared->stream,
+            ERROR_AT(prev_token(stream), stream,
                 "'r%d' is missing a declaration", val->reg.index);
             return true;
         }
@@ -451,7 +448,7 @@ static bool parse_raw_value(value *val, frontend_ctx *ctx) {
         val->kind = VAL_EXPR;
         return true;
     }
-    if (val->is_addr) EXPECT(ctx->shared->stream, "expected an address expression after '['");
+    if (val->is_addr) EXPECT(stream, "expected an address expression after '['");
     return false;
 }
 static bool parse_value(value *val, frontend_ctx *ctx) {
