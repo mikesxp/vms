@@ -459,9 +459,15 @@ static void emit_mul_div(codegen_ctx *c) {
                 "multiplying or dividing by 1 has no observable effect and will be optimized away");
             return;
         }
-        if (is_mul && *result == 2) {
-            emit_instr(c, MN_ADD, &c->instr->bin.lhs, &c->instr->bin.lhs, c->instr->bin.tok);
-            return;
+        if (is_mul) {
+            if (*result == 2) {
+                emit_instr(c, MN_ADD, &c->instr->bin.lhs, &c->instr->bin.lhs, c->instr->bin.tok);
+                return;
+            }
+            if (*result == 0) {
+                report(c->instr->bin.tok, DIAGNOSTIC_WARNING, false, c->stream,
+                    "multiplying by 0 has the same effect of a 'mov r, 0'");
+            }
         }
         if (is_power_of_two(*result, (int*)result)) {
             c->instr->bin.rhs.size = SIZE_BYTE;
@@ -545,7 +551,7 @@ static bool updates_zero_flag(ir_instr *instr) {
     switch(instr->kind) {
     case INSTR_ADD: case INSTR_SUB: case INSTR_MUL: case INSTR_DIV: case INSTR_AND: 
     case INSTR_OR:  case INSTR_XOR: case INSTR_NOT: case INSTR_SHL: case INSTR_SHR: 
-    case INSTR_ROL: case INSTR_ROR: case INSTR_CMP: return true;
+    case INSTR_ROL: case INSTR_ROR: return true;
     default: return false;
     }
 }
@@ -751,20 +757,28 @@ void sprk32_gen_instr(codegen_ctx *c) {
         break;
     case INSTR_CMP: {
         value *lhs = &c->instr->bin.lhs;
+        value *rhs = &c->instr->bin.rhs;
+        token *tok = c->instr->bin.tok;
+        ir_instr *last_instr = c->instr_index > 0 ? vector_get(c->instrs, c->instr_index-1) : NULL;
+        bool rhs_is_zero = value_is_simple(rhs, VAL_EXPR) && !rhs->expr->result;
+
+        eval_value(c, lhs);
+        eval_value(c, rhs);
         if (lhs->op_type == OPERATOR_BIT_AND) {
             int next_jmp_index = c->instr_index+1;
-            ir_instr *next_jmp = vector_get(c->instrs, next_jmp_index);
-            while (next_jmp->kind != INSTR_JMP) {
+            ir_instr *next_jmp = NULL;
+            for (;;) {
                 if (next_jmp_index >= c->instrs->count) goto emit_cmp;
-                next_jmp = vector_get(c->instrs, next_jmp_index++);
+                next_jmp = vector_get(c->instrs, next_jmp_index);
+                if (next_jmp->kind == INSTR_JMP) break;
+                next_jmp_index++;
             }
             if (next_jmp->branch.type != BRANCH_EQ && next_jmp->branch.type != BRANCH_NEQ) {
-                ERROR_AT(c->instr->bin.tok, c->stream, "'&' can only be used with '== 0' or '!= 0'");
+                ERROR_AT(tok, c->stream, "'&' can only be used with '== 0' or '!= 0'");
                 break;
             }
-            eval_value(c, &c->instr->bin.rhs);
-            if (!value_is_number(&c->instr->bin.rhs, 0)) {
-                ERROR_AT(c->instr->bin.tok, c->stream, "the value after '==' or '!=' must be 0");
+            if (!value_is_number(rhs, 0)) {
+                ERROR_AT(tok, c->stream, "the value after '==' or '!=' must be 0");
                 break;
             }
 
@@ -773,22 +787,33 @@ void sprk32_gen_instr(codegen_ctx *c) {
             bit_lhs.operand = NULL;
 
             eval_value(c, &bit_lhs);
-            eval_value(c, lhs->operand);
-            emit_instr(c, MN_BIT, &bit_lhs, lhs->operand, c->instr->bin.tok);
+            emit_instr(c, MN_BIT, &bit_lhs, lhs->operand, tok);
             break;
         }
         if (lhs->op_type != OPERATOR_NONE) {
-            ERROR_AT(c->instr->bin.tok, c->stream, 
+            ERROR_AT(tok, c->stream, 
                 "invalid cmp operation (the only avaiable is '&')");
             break;
         }
+        if (last_instr && value_matches(lhs, &last_instr->bin.lhs) &&
+            rhs_is_zero && updates_zero_flag(last_instr)) break;
     emit_cmp:
-        emit_binary(c, MN_CMP);
+        emit_instr(c, MN_CMP, lhs, rhs, tok);
         break;
     }
-    case INSTR_REM:
+    case INSTR_REM: {
+        eval_value(c, &c->instr->bin.lhs);
+        
+        value *rhs = &c->instr->bin.rhs;
+        eval_value(c, rhs);
+        if (rhs->kind == VAL_EXPR && is_power_of_two(rhs->expr->result, NULL)) {
+            c->instr->bin.rhs.expr->result--;
+            emit_instr(c, MN_AND, &c->instr->bin.lhs, &c->instr->bin.rhs, NULL);
+            return;
+        }
         emit_instr(c, MN_ERR, &c->instr->bin.lhs, &c->instr->bin.rhs, NULL); 
         break;
+    }
     case INSTR_LABEL: case INSTR_COUNT: break;
     }
 }
